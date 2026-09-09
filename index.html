@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+
+<head>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#111418">
+<title>報到掃描</title>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  body {
+    margin: 0;
+    font-family: "Helvetica Neue", Helvetica, "PingFang TC",
+                 "Microsoft JhengHei", Arial, sans-serif;
+    background: #111418;
+    color: #f2f4f7;
+    min-height: 100vh;
+  }
+
+  .wrap {
+    max-width: 560px;
+    margin: 0 auto;
+    padding: 14px 14px 40px;
+  }
+
+  select, button, input {
+    font-family: inherit;
+    font-size: 17px;
+  }
+
+  select {
+    width: 100%;
+    padding: 14px;
+    border-radius: 10px;
+    border: 1px solid #333b45;
+    background: #1b2027;
+    color: #f2f4f7;
+    margin-bottom: 10px;
+  }
+
+  .btn {
+    width: 100%;
+    padding: 16px;
+    font-size: 19px;
+    font-weight: 700;
+    border: none;
+    border-radius: 10px;
+    background: #2f80ed;
+    color: white;
+    cursor: pointer;
+    margin-bottom: 10px;
+  }
+
+  .btn.stop { background: #d9534f; }
+  .btn:disabled { background: #444b55; color: #8b939d; }
+
+  .btn-row { display: flex; gap: 8px; }
+  .btn-row .btn { margin-bottom: 10px; }
+
+  .btn.ghost {
+    background: #262d36;
+    color: #cfd6de;
+    font-size: 15px;
+    font-weight: 600;
+    padding: 12px;
+  }
+
+  /* ---- 取景區 ---- */
+
+  #stage {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 3 / 4;
+    background: #000;
+    border-radius: 14px;
+    overflow: hidden;
+    display: none;
+    margin-bottom: 10px;
+  }
+
+  #video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  #frame {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+
+  #frame::before {
+    content: "";
+    position: absolute;
+    left: 12%;
+    top: 50%;
+    width: 76%;
+    aspect-ratio: 1;
+    transform: translateY(-50%);
+    border: 3px solid rgba(255, 255, 255, 0.85);
+    border-radius: 16px;
+    box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.38);
+  }
+
+  #frame.hit::before { border-color: #4ade80; }
+
+  .cam-tools {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 10px;
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    padding: 0 12px;
+  }
+
+  .cam-tools button {
+    background: rgba(0, 0, 0, 0.55);
+    color: white;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 999px;
+    padding: 9px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  #zoomWrap {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 2px 10px;
+    font-size: 13px;
+    color: #98a2ae;
+  }
+
+  #zoom { flex: 1; }
+
+  /* ---- 結果 ---- */
+
+  .result {
+    font-size: 32px;
+    font-weight: 800;
+    text-align: center;
+    margin: 14px 0 6px;
+    min-height: 42px;
+    word-break: break-word;
+    white-space: pre-line;
+  }
+
+  .sub {
+    font-size: 18px;
+    text-align: center;
+    color: #98a2ae;
+    min-height: 30px;
+    white-space: pre-line;
+    line-height: 1.45;
+  }
+
+  .ok { color: #4ade80; }
+  .err { color: #f87171; }
+  .warn { color: #fbbf24; }
+
+  .manual {
+    margin-top: 18px;
+    border-top: 1px solid #262d36;
+    padding-top: 14px;
+  }
+
+  .manual label {
+    display: block;
+    font-size: 13px;
+    color: #8b939d;
+    margin-bottom: 7px;
+  }
+
+  #manualInput {
+    width: 100%;
+    padding: 14px;
+    border-radius: 10px;
+    border: 1px solid #333b45;
+    background: #1b2027;
+    color: #f2f4f7;
+    font-size: 18px;
+  }
+
+  .recent {
+    margin-top: 18px;
+    font-size: 14px;
+    color: #8b939d;
+  }
+
+  .recent div {
+    padding: 7px 0;
+    border-bottom: 1px solid #21272f;
+  }
+
+  .note {
+    font-size: 12px;
+    color: #6d7682;
+    line-height: 1.7;
+    margin-top: 16px;
+  }
+</style>
+
+</head>
+
+<body>
+
+<div class="wrap">
+
+  <select id="courseSelect"></select>
+
+  <button class="btn" id="btnScan">▶ 開始掃描</button>
+
+  <div id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <div id="frame"></div>
+    <div class="cam-tools">
+      <button id="btnTorch" hidden>🔦 手電筒</button>
+      <button id="btnFlip">🔄 切換鏡頭</button>
+    </div>
+  </div>
+
+  <div id="zoomWrap">
+    <span>放大</span>
+    <input type="range" id="zoom">
+  </div>
+
+  <div class="result" id="result">載入課程中…</div>
+  <div class="sub" id="sub"></div>
+
+  <div class="manual">
+    <label for="manualInput">掃不到時，手動輸入 QR 文字或姓名後按 Enter</label>
+    <input type="text" id="manualInput" placeholder="輸入後按 Enter" autocomplete="off"
+           autocapitalize="off" spellcheck="false" disabled>
+  </div>
+
+  <div class="recent" id="recent"></div>
+
+  <div class="note" id="note"></div>
+
+</div>
+
+
+<script>
+/* =========================================================
+   ★ 設定：這兩行改成你自己的
+   ========================================================= */
+
+const API_URL   = 'https://script.google.com/macros/s/AKfycbzuYtSpP4G8Xc3Hic44FV-MWZ1F3Yu_xQqKylEVLITIvdC4MjkKPrfM5t6BiX0quC9Q/exec';
+const API_TOKEN = '3f350a2c70d6b4dbd9d6e62c';
+
+
+/* =========================================================
+   狀態
+   ========================================================= */
+
+let currentCourse = '';
+let stream = null;
+let track = null;
+let scanning = false;
+let busy = false;              // 正在送出報到
+let rafId = null;
+let facingMode = 'environment';
+
+let lastCode = '';
+let lastCodeTime = 0;
+const SAME_CODE_COOLDOWN = 3000;
+
+const recentList = [];
+
+const video   = document.getElementById('video');
+const stage   = document.getElementById('stage');
+const frameEl = document.getElementById('frame');
+
+const canvas = document.createElement('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+let detector = null;
+let detectorChecked = false;
+
+
+/* =========================================================
+   JSONP：跨網域呼叫 Apps Script，完全不碰 CORS
+   ========================================================= */
+
+let jsonpSeq = 0;
+
+function api(params) {
+
+  return new Promise(function (resolve, reject) {
+
+    const cb = '__cb' + (jsonpSeq++) + '_' + Date.now();
+    const s = document.createElement('script');
+
+    const timer = setTimeout(function () {
+      cleanup();
+      reject(new Error('連線逾時，請檢查網路或部署設定'));
+    }, 20000);
+
+    function cleanup() {
+      clearTimeout(timer);
+      try { delete window[cb]; } catch (e) { window[cb] = undefined; }
+      if (s.parentNode) s.parentNode.removeChild(s);
+    }
+
+    window[cb] = function (data) { cleanup(); resolve(data); };
+
+    const qs = Object.keys(params).map(function (k) {
+      return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+    }).join('&');
+
+    s.src = API_URL + '?' + qs +
+            '&token=' + encodeURIComponent(API_TOKEN) +
+            '&callback=' + cb +
+            '&_=' + Date.now();
+
+    s.onerror = function () {
+      cleanup();
+      reject(new Error('無法連線到 Apps Script（網址或部署權限有問題）'));
+    };
+
+    document.head.appendChild(s);
+  });
+}
+
+
+/* =========================================================
+   Big5 / GBK 中文修正
+   （jsQR 只會用 UTF-8 解，中文 QR 會回傳空字串）
+   ========================================================= */
+
+const COMMON_HANZI = '的一是不了在人有我他这个们中来上大为和国地到以说时要就出会可也你对生能而子那得于着下自之年过发后作里用道行所然家种事成方多经么去法学如都同现当没动面起看定天分还进好小部其些主样理心她本前开但因只从想实日军者意无力它与长把机十民第公此已工使情明性知全三又关点正业外将两高间由问很最重并物手应战向头文体政美相见被利什二等产或新己制身果加西斯月话合回特代内信表化老给世位次度门任常先海通教儿原东声提立及比员解水名真论处走义各入几口认条平系气题活尔更别打女变四神总何电数安少报才结反受目太量再感建务做接必场件计管期市直德资命山金指克许统区保至队形社便空决治展马科司五基眼书非则听白却界达光放强即像难且权思王象完设式色路记南品住告类求据程北边死张该交规万取拉格望觉术领共确传师观清今切院让识候带导争运笑飞风步改收根干造言联持组每济车亲极林服快办议往元英士证近失转夫令准布始怎呢存未远叫台单影具罗字爱击流备兵连调深商算质团集百需价花党华城石级整府离况亚请技际约示复病息究线似官火断精满支视消越器容照须九增研写称企八功严课黄杨赵吴周徐孙朱胡郭梁郑宋谢唐韩曹邓萧冯曾蔡彭潘袁董余苏叶吕魏蒋田杜丁沈姜范江傅钟卢汪戴崔陆廖姚邱夏谭韦贾邹熊孟秦阎薛侯雷龙段郝孔邵史毛顾赖武康贺尹钱施牛洪龚伟刘學國會來時個們對這樣經過還發後與長開間進實現當種頭問幾點業體車東馬麼義門張說話語書畫圖為無萬麗鄉聲藝響應該權導總結課報產處證務員師機關係統選擇劉華偉陳黃楊趙吳孫鄭羅謝韓許鄧蕭馮餘蘇葉呂蔣鍾盧陸譚韋賈鄒閻龍顧賴嚴錢龔怡君並讓認識豐線靈壽豔臺灣號碼簽';
+
+function bytesToText(bytes) {
+
+  if (!bytes || !bytes.length) return null;
+
+  const arr = Uint8Array.from(bytes);
+
+  try {
+    const s = new TextDecoder('utf-8', { fatal: true }).decode(arr).trim();
+    if (s) return s;
+  } catch (e) {}
+
+  const encodings = ['big5', 'gb18030', 'shift_jis', 'euc-kr', 'windows-1252'];
+
+  let best = null;
+  let bestScore = Infinity;
+
+  for (let i = 0; i < encodings.length; i++) {
+    try {
+      const s = new TextDecoder(encodings[i]).decode(arr).trim();
+      if (!s) continue;
+
+      const bad  = (s.match(/�/g) || []).length;
+      const junk = (s.match(/[ -ÿ｡-ﾟ]/g) || []).length;
+
+      let cjk = 0, common = 0;
+      for (let k = 0; k < s.length; k++) {
+        const ch = s.charAt(k);
+        if (/[㐀-鿿豈-﫿]/.test(ch)) {
+          cjk++;
+          if (COMMON_HANZI.indexOf(ch) >= 0) common++;
+        }
+      }
+
+      const ascii = (s.match(/[\x20-\x7E]/g) || []).length;
+
+      const score = bad * 1000 + junk * 50 + (cjk - common) * 12
+                    - common * 10 - ascii + i * 3;
+
+      if (score < bestScore) { bestScore = score; best = s; }
+
+    } catch (e) {}
+  }
+
+  if (best) return best;
+
+  let ascii = '';
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] >= 32 && arr[i] < 127) ascii += String.fromCharCode(arr[i]);
+  }
+  return ascii.trim() || null;
+}
+
+
+/* =========================================================
+   相機
+   ========================================================= */
+
+async function getDetector() {
+
+  if (detectorChecked) return detector;
+  detectorChecked = true;
+
+  try {
+    if (typeof window.BarcodeDetector === 'function') {
+      const f = await window.BarcodeDetector.getSupportedFormats();
+      if (f && f.indexOf('qr_code') >= 0) {
+        detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+      }
+    }
+  } catch (e) { detector = null; }
+
+  return detector;
+}
+
+
+async function startScan() {
+
+  if (!currentCourse) { show('請先選擇課程', '', 'warn'); return; }
+  if (scanning) { stopScan(); return; }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    show('此瀏覽器不支援相機', '請改用手動輸入', 'err');
+    return;
+  }
+
+  try {
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { ideal: facingMode },
+        width:  { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    });
+
+    video.srcObject = stream;
+    await video.play();
+
+    track = stream.getVideoTracks()[0];
+
+    setupTorchAndZoom();
+
+    scanning = true;
+    stage.style.display = 'block';
+
+    document.getElementById('btnScan').textContent = '■ 停止掃描';
+    document.getElementById('btnScan').classList.add('stop');
+
+    show('掃描中…', '把 QR 對準白框', '');
+
+    await getDetector();
+    loop();
+
+  } catch (error) {
+
+    let msg = error && error.message ? error.message : String(error);
+
+    if (error && (error.name === 'NotAllowedError' || error.name === 'SecurityError')) {
+      msg = '相機權限被拒絕。請在網址列的鎖頭圖示裡允許相機，再重新整理。';
+    } else if (error && error.name === 'NotFoundError') {
+      msg = '找不到相機裝置。';
+    }
+
+    show('無法開啟相機', msg, 'err');
+  }
+}
+
+
+function stopScan() {
+
+  scanning = false;
+
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+
+  if (stream) {
+    stream.getTracks().forEach(function (t) { t.stop(); });
+    stream = null;
+    track = null;
+  }
+
+  video.srcObject = null;
+  stage.style.display = 'none';
+  document.getElementById('zoomWrap').style.display = 'none';
+
+  document.getElementById('btnScan').textContent = '▶ 開始掃描';
+  document.getElementById('btnScan').classList.remove('stop');
+}
+
+
+function setupTorchAndZoom() {
+
+  const btnTorch = document.getElementById('btnTorch');
+  const zoomWrap = document.getElementById('zoomWrap');
+  const zoom = document.getElementById('zoom');
+
+  btnTorch.hidden = true;
+  zoomWrap.style.display = 'none';
+
+  if (!track || !track.getCapabilities) return;
+
+  let caps = {};
+  try { caps = track.getCapabilities() || {}; } catch (e) { return; }
+
+  if (caps.torch) {
+    btnTorch.hidden = false;
+    let on = false;
+    btnTorch.onclick = function () {
+      on = !on;
+      track.applyConstraints({ advanced: [{ torch: on }] }).catch(function () {});
+      btnTorch.style.background = on ? 'rgba(255,200,0,.85)' : 'rgba(0,0,0,.55)';
+      btnTorch.style.color = on ? '#000' : '#fff';
+    };
+  }
+
+  if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+    zoomWrap.style.display = 'flex';
+    zoom.min = caps.zoom.min;
+    zoom.max = caps.zoom.max;
+    zoom.step = caps.zoom.step || 0.1;
+    zoom.value = track.getSettings().zoom || caps.zoom.min;
+    zoom.oninput = function () {
+      track.applyConstraints({ advanced: [{ zoom: Number(zoom.value) }] }).catch(function () {});
+    };
+  }
+}
+
+
+async function flipCamera() {
+  facingMode = (facingMode === 'environment') ? 'user' : 'environment';
+  if (scanning) { stopScan(); await startScan(); }
+}
+
+
+/* =========================================================
+   掃描迴圈
+   ========================================================= */
+
+let lastTick = 0;
+let useCenterCrop = false;
+
+async function loop() {
+
+  if (!scanning) return;
+
+  rafId = requestAnimationFrame(loop);
+
+  const now = performance.now();
+  if (now - lastTick < 90) return;   // 約 11 fps，省電也夠用
+  lastTick = now;
+
+  if (busy) return;
+  if (video.readyState < 2 || !video.videoWidth) return;
+
+  let value = null;
+
+  /* 原生偵測器：最快最準 */
+  if (detector) {
+    try {
+      const codes = await detector.detect(video);
+      if (codes && codes.length) {
+        value = (codes[0].rawValue || '').trim() || null;
+      }
+    } catch (e) {}
+  }
+
+  /* jsQR 後援：整張與中央裁切輪流掃 */
+  if (!value && typeof jsQR === 'function') {
+
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+
+    useCenterCrop = !useCenterCrop;
+
+    let sx = 0, sy = 0, sw = vw, sh = vh;
+
+    if (useCenterCrop) {
+      const n = Math.min(vw, vh) * 0.6;
+      sx = (vw - n) / 2;
+      sy = (vh - n) / 2;
+      sw = n;
+      sh = n;
+    }
+
+    const scale = Math.min(1, 640 / Math.max(sw, sh));
+    const dw = Math.max(1, Math.round(sw * scale));
+    const dh = Math.max(1, Math.round(sh * scale));
+
+    canvas.width = dw;
+    canvas.height = dh;
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+
+    try {
+      const img = ctx.getImageData(0, 0, dw, dh);
+      const r = jsQR(img.data, dw, dh, { inversionAttempts: 'attemptBoth' });
+
+      if (r) {
+        value = (r.data || '').trim() || bytesToText(r.binaryData);
+      }
+    } catch (e) {}
+  }
+
+  if (!value) return;
+
+  /* 同一張 QR 停在鏡頭前時不重複送 */
+  if (value === lastCode && now - lastCodeTime < SAME_CODE_COOLDOWN) return;
+
+  lastCode = value;
+  lastCodeTime = now;
+
+  frameEl.classList.add('hit');
+  setTimeout(function () { frameEl.classList.remove('hit'); }, 500);
+
+  submit(value);
+}
+
+
+/* =========================================================
+   送出報到
+   ========================================================= */
+
+async function submit(value) {
+
+  if (busy) return;
+  if (!currentCourse) { show('請先選擇課程', '', 'warn'); return; }
+
+  busy = true;
+  show('處理中…', value, 'warn');
+
+  try {
+
+    const res = await api({
+      action: 'checkin',
+      course: currentCourse,
+      value: value
+    });
+
+    render(res, value);
+
+  } catch (error) {
+    show('連線失敗', error.message, 'err');
+    beep(false);
+    buzz(false);
+  } finally {
+    busy = false;
+  }
+}
+
+
+function render(res, rawValue) {
+
+  if (!res) {
+    show('系統錯誤', '沒有收到回應', 'err');
+    beep(false); buzz(false);
+    return;
+  }
+
+  if (res.type === 'success') {
+    show(res.name, '✅ 報到成功\n座位：' + res.seat + '　剩餘 ' + res.remaining + ' 堂', 'ok');
+    beep(true); buzz(true);
+    pushRecent('✅ ' + res.name + '（' + res.seat + '）');
+    return;
+  }
+
+  if (res.type === 'temporary') {
+    show('臨時加入', res.name + '\n' + res.seat, 'warn');
+    beep(true); buzz(true);
+    pushRecent('➕ ' + res.name + '（臨時）');
+    return;
+  }
+
+  if (res.type === 'duplicate') {
+    show('重複報到', res.name + '\n座位：' + res.seat, 'err');
+    beep(false); buzz(false);
+    pushRecent('⚠️ ' + res.name + '（重複）');
+    return;
+  }
+
+  if (res.type === 'no_credit') {
+    show('堂數不足', res.name + '\n剩餘可用堂數為 0', 'err');
+    beep(false); buzz(false);
+    pushRecent('⛔ ' + res.name + '（堂數 0）');
+    return;
+  }
+
+  if (res.type === 'not_found') {
+    show('查無此人', '不在本堂課名單中\n請洽櫃台以電腦處理', 'err');
+    beep(false); buzz(false);
+    pushRecent('❓ ' + String(rawValue).slice(0, 20) + '（查無）');
+    return;
+  }
+
+  if (res.type === 'busy') {
+    show('系統忙碌', '請再掃一次', 'warn');
+    lastCode = '';            // 允許立刻重掃同一張
+    beep(false); buzz(false);
+    return;
+  }
+
+  show('報到失敗', res.message || String(rawValue), 'err');
+  beep(false); buzz(false);
+}
+
+
+function pushRecent(text) {
+
+  const t = new Date();
+  const hh = ('0' + t.getHours()).slice(-2);
+  const mm = ('0' + t.getMinutes()).slice(-2);
+
+  recentList.unshift(hh + ':' + mm + '　' + text);
+  if (recentList.length > 6) recentList.pop();
+
+  document.getElementById('recent').innerHTML =
+    recentList.map(function (r) {
+      return '<div>' + escapeHtml(r) + '</div>';
+    }).join('');
+}
+
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+
+/* =========================================================
+   課程
+   ========================================================= */
+
+async function loadCourses() {
+
+  const sel = document.getElementById('courseSelect');
+
+  try {
+
+    const res = await api({ action: 'courses' });
+
+    if (!res || !res.ok) {
+      show('載入失敗', (res && res.message) || '無法取得課程', 'err');
+      return;
+    }
+
+    sel.innerHTML = '<option value="">-- 請選擇課程 --</option>';
+
+    res.courses.forEach(function (c) {
+      const o = document.createElement('option');
+      o.value = c;
+      o.textContent = c;
+      sel.appendChild(o);
+    });
+
+    // 記住上次用的課程
+    let saved = '';
+    try { saved = localStorage.getItem('lastCourse') || ''; } catch (e) {}
+
+    if (saved && res.courses.indexOf(saved) >= 0) {
+      sel.value = saved;
+      onCourseChange();
+    } else {
+      show('請選擇課程', '', '');
+    }
+
+  } catch (error) {
+    show('載入失敗', error.message, 'err');
+  }
+}
+
+
+function onCourseChange() {
+
+  currentCourse = document.getElementById('courseSelect').value;
+
+  try { localStorage.setItem('lastCourse', currentCourse); } catch (e) {}
+
+  document.getElementById('manualInput').disabled = !currentCourse;
+
+  lastCode = '';
+
+  if (currentCourse) {
+    show('準備就緒', '按「開始掃描」', '');
+  } else {
+    show('請選擇課程', '', '');
+    if (scanning) stopScan();
+  }
+}
+
+
+/* =========================================================
+   畫面 / 音效 / 震動
+   ========================================================= */
+
+function show(main, sub, type) {
+  const r = document.getElementById('result');
+  r.textContent = main;
+  r.className = 'result' + (type ? ' ' + type : '');
+  document.getElementById('sub').textContent = sub || '';
+}
+
+
+let audioCtx = null;
+
+function beep(ok) {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    if (!audioCtx) audioCtx = new AC();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+
+    osc.frequency.value = ok ? 1200 : 300;
+    gain.gain.value = 0.12;
+    osc.start();
+    osc.stop(audioCtx.currentTime + (ok ? 0.12 : 0.28));
+  } catch (e) {}
+}
+
+
+function buzz(ok) {
+  try {
+    if (navigator.vibrate) navigator.vibrate(ok ? 80 : [100, 80, 100]);
+  } catch (e) {}
+}
+
+
+/* =========================================================
+   啟動
+   ========================================================= */
+
+document.getElementById('courseSelect').addEventListener('change', onCourseChange);
+document.getElementById('btnScan').addEventListener('click', startScan);
+document.getElementById('btnFlip').addEventListener('click', flipCamera);
+
+document.getElementById('manualInput').addEventListener('keydown', function (e) {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const v = this.value.trim();
+  if (!v) return;
+  this.value = '';
+  lastCode = '';
+  submit(v);
+});
+
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden && scanning) stopScan();
+});
+
+if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+  document.getElementById('note').textContent =
+    '⚠️ 相機只能在 HTTPS 網址下使用，請用 GitHub Pages 的 https:// 網址開啟。';
+}
+
+loadCourses();
+
+</script>
+
+</body>
+</html>
