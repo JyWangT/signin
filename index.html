@@ -101,6 +101,19 @@
       background: #d9534f;
     }
 
+    .camera-button.resume {
+      background: #4CAF50;
+    }
+
+    /* 掃描進行中，把當下用不到的東西收起來，縮短頁面 */
+    body.scanning-mode #btnCamera,
+    body.scanning-mode #btnAlbum,
+    body.scanning-mode .hint,
+    body.scanning-mode #previewBox,
+    body.scanning-mode #decodedPanel {
+      display: none !important;
+    }
+
     .camera-button.secondary {
       background: #6c7a89;
       font-size: 17px;
@@ -117,8 +130,8 @@
     #stage {
       position: relative;
       width: 100%;
-      max-width: 420px;
-      aspect-ratio: 3 / 4;
+      max-width: 320px;
+      height: 240px;
       background: #000;
       border-radius: 12px;
       overflow: hidden;
@@ -142,11 +155,11 @@
     #frame::before {
       content: "";
       position: absolute;
-      left: 12%;
+      left: 50%;
       top: 50%;
-      width: 76%;
+      height: 78%;
       aspect-ratio: 1;
-      transform: translateY(-50%);
+      transform: translate(-50%, -50%);
       border: 3px solid rgba(255, 255, 255, 0.85);
       border-radius: 14px;
       box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.35);
@@ -361,8 +374,16 @@
       .sub-text { font-size: 18pt; }
       input[type="text"] { font-size: 20px; }
       .camera-button { font-size: 19px; }
-      #stage { max-width: 100%; }
       .dash-panel { align-self: stretch; }
+
+      /* 手機螢幕短，取景框壓低，讓報到結果不用捲動就看得到 */
+      #stage { max-width: 100%; height: 190px; }
+      .result-text { font-size: 26pt; margin: 14px 0 6px 0; min-height: 40px; }
+      .sub-text { font-size: 16pt; min-height: 36px; }
+      .hint { margin: 2px 0 8px 0; }
+      .camera-button { padding: 12px; margin-bottom: 8px; }
+      .version-tag { display: none; }
+      .top-bar { margin-bottom: 12px; }
     }
 
   </style>
@@ -372,7 +393,7 @@
 
 <body>
 
-  <p style="font-size:12px;color:#777">即時掃描版 v6</p>
+  <p class="version-tag" style="font-size:12px;color:#777">即時掃描版 v7</p>
 
 
   <!-- ========== 課程 ========== -->
@@ -823,10 +844,19 @@ async function startScan() {
 
     scanning = true;
     document.getElementById('stage').style.display = 'block';
+    document.body.classList.add('scanning-mode');
 
     const btn = document.getElementById('btnScan');
     btn.textContent = '■ 停止掃描';
     btn.classList.add('scanning');
+
+    btn.classList.remove('resume');
+
+    /*
+     * 剛剛那個人可能還站在鏡頭前，
+     * 重新開始時把冷卻時間重算，避免立刻又掃到同一張。
+     */
+    lastCodeTime = performance.now();
 
     showUI('掃描中…', '把 QR 對準白框', '');
     setDiag('');
@@ -851,7 +881,7 @@ async function startScan() {
 }
 
 
-function stopScan() {
+function stopScan(pausedForResult) {
 
   scanning = false;
 
@@ -863,15 +893,44 @@ function stopScan() {
     track = null;
   }
 
+  document.body.classList.remove('scanning-mode');
+
   document.getElementById('video').srcObject = null;
   document.getElementById('stage').style.display = 'none';
   document.getElementById('zoomWrap').style.display = 'none';
 
   const btn = document.getElementById('btnScan');
-  btn.textContent = '📷 開始即時掃描';
   btn.classList.remove('scanning');
 
+  if (pausedForResult) {
+    btn.textContent = '🔄 掃描下一位';
+    btn.classList.add('resume');
+  } else {
+    btn.textContent = '📷 開始即時掃描';
+    btn.classList.remove('resume');
+  }
+
   updateButtons();
+}
+
+
+/*
+ * 報到有結果就先停下來，讓工作人員看清楚畫面，
+ * 按「掃描下一位」才重新開相機。
+ */
+function pauseAfterResult() {
+
+  if (scanning) stopScan(true);
+
+  // 手機螢幕短，把結果捲到看得到的位置
+  if (isTouchDevice()) {
+    setTimeout(function () {
+      const el = document.getElementById('resultDisplay');
+      if (el && el.scrollIntoView) {
+        el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }
+    }, 60);
+  }
 }
 
 
@@ -1746,6 +1805,7 @@ function handleCheckInResult(result) {
   if (!result) {
     showUI('系統錯誤', '沒有收到伺服器回應', 'error');
     playSound('error');
+    pauseAfterResult();
     return;
   }
 
@@ -1757,6 +1817,7 @@ function handleCheckInResult(result) {
     );
     playSound('success');
     vibrateSuccess();
+    pauseAfterResult();
     return;
   }
 
@@ -1764,6 +1825,7 @@ function handleCheckInResult(result) {
     showUI('臨時人員加入成功', result.name + '\n座位：' + result.seat, 'warn');
     playSound('success');
     vibrateSuccess();
+    pauseAfterResult();
     return;
   }
 
@@ -1771,6 +1833,7 @@ function handleCheckInResult(result) {
     showUI('重複報到', result.name + '\n座位：' + result.seat, 'error');
     playSound('error');
     vibrateError();
+    pauseAfterResult();
     return;
   }
 
@@ -1778,9 +1841,13 @@ function handleCheckInResult(result) {
     showUI('堂數不足', result.name + '\n剩餘可用堂數為 0', 'error');
     playSound('error');
     vibrateError();
+    pauseAfterResult();
     return;
   }
 
+  /*
+   * 系統忙碌是暫時性的，不停相機，讓它自己再掃一次
+   */
   if (result.type === 'busy') {
     showUI('系統忙碌', '請重新掃描一次', 'warn');
     lastCode = '';
@@ -1792,6 +1859,7 @@ function handleCheckInResult(result) {
   showUI('報到失敗', result.message || '未知錯誤', 'error');
   playSound('error');
   vibrateError();
+  pauseAfterResult();
 }
 
 
