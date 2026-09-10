@@ -486,7 +486,6 @@
       <div id="pendingBox" style="display:none;font-size:14px;padding:8px 10px;border-radius:6px;margin-bottom:10px;"></div>
 
       <div style="font-size:12px;color:#999;margin-bottom:12px;">
-        <span id="syncStamp"></span>
         <button id="btnRefresh" onclick="fetchCourseData(false)"
                 style="border:none;background:none;color:#2196F3;cursor:pointer;font-size:12px;padding:0 4px;">
           🔄 立即更新
@@ -563,6 +562,13 @@ let draining = false;
 let drainFailed = false;
 let mismatches = [];
 
+/* 同步狀態：用來算「還要多久」和「什麼時候一致的」 */
+let lastBatchMs = 0;        // 上一批實際花的毫秒，拿來估算剩餘時間
+let drainStartedAt = 0;
+let lastWriteOkAt = 0;      // 最後一次「全部寫進 Sheet」的時間
+let nextRetryAt = 0;
+let statusTimer = null;
+
 const BATCH_MAX = 15;
 const DRAIN_DELAY_MS = 400;     // 連續掃描時稍等一下，讓多筆併成一趟
 const RETRY_DELAY_MS = 4000;
@@ -595,6 +601,7 @@ const SAME_CODE_COOLDOWN = 3000;
 window.onload = function () {
   loadQueue();
   renderPending();
+  startStatusTicker();
   if (queue.length) scheduleDrain(1500);
   loadCourses();
 };
@@ -960,6 +967,7 @@ function drain() {
   if (batch.length === 0) return;
 
   draining = true;
+  drainStartedAt = Date.now();
   renderPending();
 
   const needRoster = (Date.now() - lastSyncAt) > ROSTER_MAX_AGE_MS ? 1 : 0;
@@ -989,6 +997,8 @@ function drain() {
         }
 
         drainFailed = false;
+        lastBatchMs = Date.now() - drainStartedAt;
+        if (queue.length === 0) lastWriteOkAt = Date.now();
 
       } else {
         throw new Error((res && res.message) || '同步失敗');
@@ -1015,8 +1025,14 @@ function drain() {
        * 失敗才等久一點重試。
        */
       if (queue.length) {
-        scheduleDrain(drainFailed ? RETRY_DELAY_MS : DRAIN_DELAY_MS);
+        const delay = drainFailed ? RETRY_DELAY_MS : DRAIN_DELAY_MS;
+        nextRetryAt = Date.now() + delay;
+        scheduleDrain(delay);
+      } else {
+        nextRetryAt = 0;
       }
+
+      renderPending();
     });
 }
 
@@ -1066,6 +1082,40 @@ function reconcile(results) {
 }
 
 
+function fmtSecs(ms) {
+  const sec = Math.max(0, Math.round(ms / 1000));
+  if (sec < 60) return sec + ' 秒';
+  return Math.round(sec / 60) + ' 分鐘';
+}
+
+
+function fmtClock(ts) {
+  const d = new Date(ts);
+  return ('0' + d.getHours()).slice(-2) + ':' +
+         ('0' + d.getMinutes()).slice(-2) + ':' +
+         ('0' + d.getSeconds()).slice(-2);
+}
+
+
+/*
+ * 估算還要多久才會全部寫進 Sheet。
+ * 用上一批實際花掉的時間推算，沒資料時先當 2.5 秒。
+ */
+function estimateRemainingMs() {
+
+  const per = lastBatchMs || 2500;
+  const batches = Math.max(1, Math.ceil(queue.length / BATCH_MAX));
+
+  if (draining) {
+    const elapsed = Date.now() - drainStartedAt;
+    return Math.max(300, per - elapsed) + (batches - 1) * per;
+  }
+
+  const wait = nextRetryAt ? Math.max(0, nextRetryAt - Date.now()) : DRAIN_DELAY_MS;
+  return wait + batches * per;
+}
+
+
 function renderPending() {
 
   const box = document.getElementById('pendingBox');
@@ -1073,32 +1123,87 @@ function renderPending() {
 
   const stuck = queue.filter(function (x) { return x.tries >= 2; }).length;
 
-  if (mismatches.length) {
+  let bg, fg, lines;
 
-    box.style.display = 'block';
-    box.style.background = '#fdecea';
-    box.style.color = '#b3261e';
-    box.textContent = '⚠️ ' + mismatches.slice(-3).join('；') +
-      '（伺服器與畫面不一致，請以 Sheet 為準）';
+  if (queue.length === 0) {
+
+    /* ---------- 一致 ---------- */
+    bg = '#e8f5e9';
+    fg = '#1b5e20';
+
+    lines = ['✅ 畫面與 Sheet 已一致'];
+
+    if (lastWriteOkAt) {
+      lines.push('最後寫入 ' + fmtClock(lastWriteOkAt));
+    }
+
+    if (lastSyncAt) {
+      lines.push('名單更新於 ' + fmtClock(lastSyncAt) +
+                 '（' + fmtSecs(Date.now() - lastSyncAt) + '前）');
+    }
 
   } else if (stuck) {
 
-    box.style.display = 'block';
-    box.style.background = '#fdecea';
-    box.style.color = '#b3261e';
-    box.textContent = '⚠️ ' + queue.length + ' 筆還沒寫進 Sheet，連線有問題。先別關掉這一頁。';
+    /* ---------- 寫不進去 ---------- */
+    bg = '#fdecea';
+    fg = '#b3261e';
 
-  } else if (queue.length) {
+    const wait = nextRetryAt ? Math.max(0, nextRetryAt - Date.now()) : 0;
 
-    box.style.display = 'block';
-    box.style.background = '#fff8e1';
-    box.style.color = '#8a6d00';
-    box.textContent = '⏳ 背景寫入中… 還有 ' + queue.length + ' 筆';
+    lines = [
+      '⚠️ ' + queue.length + ' 筆還沒寫進 Sheet',
+      draining
+        ? '正在重試…'
+        : (wait > 0 ? fmtSecs(wait) + '後自動重試' : '準備重試…') +
+          '（已試 ' + queue[0].tries + ' 次）',
+      '網路恢復前請不要關掉這一頁'
+    ];
 
   } else {
-    box.style.display = 'none';
-    box.textContent = '';
+
+    /* ---------- 寫入中 ---------- */
+    bg = '#fff8e1';
+    fg = '#8a6d00';
+
+    lines = [
+      '⏳ 寫入中 ' + queue.length + ' 筆',
+      '約 ' + fmtSecs(estimateRemainingMs()) + '後與 Sheet 一致'
+    ];
   }
+
+  box.style.display = 'block';
+  box.style.background = bg;
+  box.style.color = fg;
+  box.style.lineHeight = '1.6';
+
+  let html = lines.map(function (t, i) {
+    return i === 0
+      ? '<strong>' + escapeHtml(t) + '</strong>'
+      : '<span style="font-size:12px;opacity:.85">' + escapeHtml(t) + '</span>';
+  }).join('<br>');
+
+  if (mismatches.length) {
+    html += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(0,0,0,.12);' +
+            'font-size:12px;color:#b3261e">⚠️ ' +
+            escapeHtml(mismatches.slice(-3).join('；')) +
+            '<br>（以 Sheet 為準）</div>';
+  }
+
+  box.innerHTML = html;
+}
+
+
+function escapeHtml(t) {
+  return String(t).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+
+/* 每秒重畫一次，倒數和「幾秒前」才會動 */
+function startStatusTicker() {
+  if (statusTimer) return;
+  statusTimer = setInterval(renderPending, 1000);
 }
 
 
@@ -2316,19 +2421,7 @@ function renderDashboard() {
       : '目前全員皆已報到或尚無名單';
   }
 
-  const stamp = document.getElementById('syncStamp');
-
-  if (stamp) {
-    if (!lastSyncAt) {
-      stamp.textContent = '';
-    } else {
-      const d = new Date(lastSyncAt);
-      stamp.textContent = '更新於 ' +
-        ('0' + d.getHours()).slice(-2) + ':' +
-        ('0' + d.getMinutes()).slice(-2) + ':' +
-        ('0' + d.getSeconds()).slice(-2);
-    }
-  }
+  renderPending();
 }
 
 
