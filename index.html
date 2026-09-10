@@ -450,7 +450,7 @@
              onchange="scanQrPhoto(event)" hidden>
 
       <div class="hint">
-        即時掃描把 QR 對準白框即可，不用按快門。<br>
+        相機會一直開著，一個接一個掃，不用按任何按鈕。<br>
         相機開不起來時，改用下面的拍照識別。
       </div>
 
@@ -531,7 +531,7 @@
    ★ 設定：這兩行改成你自己的
    ========================================================= */
 
-const API_URL   = 'https://script.google.com/macros/s/AKfycbzuYtSpP4G8Xc3Hic44FV-MWZ1F3Yu_xQqKylEVLITIvdC4MjkKPrfM5t6BiX0quC9Q/exec';
+const API_URL   = 'https://script.google.com/macros/s/請貼上你的部署ID/exec';
 const API_TOKEN = '3f350a2c70d6b4dbd9d6e62c';
 
 
@@ -573,14 +573,29 @@ const BATCH_MAX = 15;
 const DRAIN_DELAY_MS = 400;     // 連續掃描時稍等一下，讓多筆併成一趟
 const RETRY_DELAY_MS = 4000;
 
-/* 閒著沒事時重新抓一次名單（兩台手機互相同步靠這個） */
-const SYNC_INTERVAL_MS = 45000;
+/* ---------- 多台手機同步（可自行調整）---------- */
 
 /*
- * 名單超過這個時間沒更新，下一次批次送出就順便要一份新的。
- * 多台手機一起報到時，這是它們互相看見對方的管道。
+ * 忙碌中（相機開著或還有東西沒送出）多久跟 Sheet 對一次。
+ *
+ * 現場 3～5 台手機一起報到，這個值決定各台多快看到別台掃的人。
+ * 伺服器端把名單快取了 5 秒，所以就算五台同時來問，
+ * 試算表也最多 5 秒讀一次，不會把報到寫入卡住。
  */
-const ROSTER_MAX_AGE_MS = 30000;
+const SYNC_BUSY_MS = 5000;
+
+/* 閒著沒事時就不用這麼勤 */
+const SYNC_IDLE_MS = 45000;
+
+/* 按下「開始掃描」時，名單超過這麼久就順便更新 */
+const SYNC_ON_SCAN_MS = 5000;
+
+/* 3. 有東西要送出時，名單超過這麼久就搭便車捎一份新的回來（不多跑網路）
+ *    這是報到進行中兩台手機互相看見對方的主要管道，所以設得比閒置輪詢短。 */
+const ROSTER_MAX_AGE_MS = 15000;
+
+/* 名單超過這麼久沒更新，就提醒「別台的報到可能還沒反映」 */
+const ROSTER_STALE_MS = 25000;
 
 let isProcessing = false;   // 正在送出報到
 let photoBusy = false;      // 正在解照片
@@ -595,6 +610,10 @@ let facingMode = 'environment';
 
 let lastCode = '';
 let lastCodeTime = 0;
+/*
+ * 同一組 QR 的冷卻時間。
+ * 現場人多、節奏快，所以維持 3 秒。
+ */
 const SAME_CODE_COOLDOWN = 3000;
 
 
@@ -806,18 +825,23 @@ function changeCourse() {
   }
 
   syncInterval = setInterval(function () {
-    // 掃描/送出中或分頁在背景時跳過，不跟報到搶速度
-    /*
-     * 有東西要送、或正在等回應時不更新，
-     * 免得跟報到搶 Apps Script 的執行序。
-     *
-     * 但「掃描中而佇列是空的」要更新——
-     * 那是兩台手機互相看見對方的唯一管道。
-     */
+
     if (isProcessing || photoBusy || document.hidden) return;
-    if (queue.length || draining) return;
+
+    /*
+     * 忙的時候 5 秒跟 Sheet 對一次，閒的時候 45 秒。
+     *
+     * 佇列裡還沒送出的那幾筆，套用新名單時會疊回去，
+     * 所以就算正在寫入也可以安全地更新。
+     */
+    const busy = scanning || queue.length > 0;
+    const need = busy ? SYNC_BUSY_MS : SYNC_IDLE_MS;
+
+    if (Date.now() - lastSyncAt < need) return;
+
     fetchCourseData(true);
-  }, SYNC_INTERVAL_MS);
+
+  }, 2000);
 
   updateButtons();
 }
@@ -1076,7 +1100,14 @@ function reconcile(results) {
     }
   });
 
-  lastSyncAt = Date.now();
+  /*
+   * 注意：這裡不能碰 lastSyncAt。
+   *
+   * lastSyncAt 的意思是「名單是什麼時候從伺服器抓回來的」，
+   * 而 reconcile 只是處理寫入結果，並沒有拿到新名單。
+   * 之前在這裡更新，害名單年齡永遠是 0，
+   * 搭便車同步的條件就永遠不成立，兩台手機一整場都不會互相看到。
+   */
   renderDashboard();
   renderPending();
 }
@@ -1124,6 +1155,7 @@ function renderPending() {
   const stuck = queue.filter(function (x) { return x.tries >= 2; }).length;
 
   let bg, fg, lines;
+  let stale = false;
 
   if (queue.length === 0) {
 
@@ -1131,15 +1163,29 @@ function renderPending() {
     bg = '#e8f5e9';
     fg = '#1b5e20';
 
-    lines = ['✅ 畫面與 Sheet 已一致'];
+    /*
+     * 只敢保證「這台掃過的都寫進 Sheet 了」。
+     * 別台手機剛掃的人，要等名單更新才會出現在這台畫面上，
+     * 所以名單新鮮度另外講，不要混為一談。
+     */
+    lines = ['✅ 這台掃的都已寫入 Sheet'];
 
     if (lastWriteOkAt) {
       lines.push('最後寫入 ' + fmtClock(lastWriteOkAt));
     }
 
     if (lastSyncAt) {
-      lines.push('名單更新於 ' + fmtClock(lastSyncAt) +
-                 '（' + fmtSecs(Date.now() - lastSyncAt) + '前）');
+
+      const age = Date.now() - lastSyncAt;
+
+      if (age > ROSTER_STALE_MS) {
+        stale = true;
+        lines.push('⚠️ 名單是 ' + fmtSecs(age) + '前的，' +
+                   '別台手機剛報到的人可能還沒顯示');
+      } else {
+        lines.push('名單更新於 ' + fmtClock(lastSyncAt) +
+                   '（' + fmtSecs(age) + '前）');
+      }
     }
 
   } else if (stuck) {
@@ -1169,6 +1215,11 @@ function renderPending() {
       '⏳ 寫入中 ' + queue.length + ' 筆',
       '約 ' + fmtSecs(estimateRemainingMs()) + '後與 Sheet 一致'
     ];
+  }
+
+  if (stale) {
+    bg = '#fff8e1';
+    fg = '#8a6d00';
   }
 
   box.style.display = 'block';
@@ -1287,6 +1338,16 @@ async function startScan() {
      */
     lastCodeTime = performance.now();
 
+    /*
+     * 開始掃描是個天然的同步點。
+     *
+     * 相機一開就把別台手機掃過的人抓回來一次。
+     * 背景進行，不會拖慢掃描。
+     */
+    if ((Date.now() - lastSyncAt) > SYNC_ON_SCAN_MS) {
+      fetchCourseData(true);
+    }
+
     showUI('掃描中…', '把 QR 對準白框', '');
     setDiag('');
 
@@ -1310,7 +1371,7 @@ async function startScan() {
 }
 
 
-function stopScan(pausedForResult) {
+function stopScan() {
 
   scanning = false;
 
@@ -1330,41 +1391,21 @@ function stopScan(pausedForResult) {
 
   const btn = document.getElementById('btnScan');
   btn.classList.remove('scanning');
-
-  if (pausedForResult) {
-    btn.textContent = '🔄 掃描下一位';
-    btn.classList.add('resume');
-  } else {
-    btn.textContent = '📷 開始即時掃描';
-    btn.classList.remove('resume');
-  }
+  btn.classList.remove('resume');
+  btn.textContent = '📷 開始即時掃描';
 
   updateButtons();
 }
 
 
 /*
- * 報到有結果就先停下來，讓工作人員看清楚畫面，
- * 按「掃描下一位」才重新開相機。
+ * 報到有結果之後——相機不關，繼續掃下一個人。
+ *
+ * 不會重複掃到同一個人，因為同一組 QR 有冷卻時間；
+ * 而且就算真的又掃到，重複報到是本地判定，不會多送一次網路。
  */
 function pauseAfterResult() {
-
-  if (scanning) {
-    stopScan(true);
-  } else if (manualStop) {
-    // 使用者按了停止，就維持「開始即時掃描」，不改成「掃描下一位」
-    manualStop = false;
-  }
-
-  // 手機螢幕短，把結果捲到看得到的位置
-  if (isTouchDevice()) {
-    setTimeout(function () {
-      const el = document.getElementById('resultDisplay');
-      if (el && el.scrollIntoView) {
-        el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      }
-    }, 60);
-  }
+  manualStop = false;
 }
 
 
