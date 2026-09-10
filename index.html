@@ -1169,11 +1169,11 @@ function renderPending() {
      * 所以名單新鮮度另外講，不要混為一談。
      */
     lines = ['✅ 這台掃的都已寫入 Sheet'];
-
-    if (lastWriteOkAt) {
-      lines.push('最後寫入 ' + fmtClock(lastWriteOkAt));
-    }
-
+   /*
+   * if (lastWriteOkAt) {
+   *   lines.push('最後寫入 ' + fmtClock(lastWriteOkAt));
+   * }
+     */
     if (lastSyncAt) {
 
       const age = Date.now() - lastSyncAt;
