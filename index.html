@@ -530,7 +530,7 @@
    ★ 設定：這兩行改成你自己的
    ========================================================= */
 
-const API_URL   = 'https://script.google.com/macros/s/AKfycbzuYtSpP4G8Xc3Hic44FV-MWZ1F3Yu_xQqKylEVLITIvdC4MjkKPrfM5t6BiX0quC9Q/exec';
+const API_URL   = 'https://script.google.com/macros/s/請貼上你的部署ID/exec';
 const API_TOKEN = '3f350a2c70d6b4dbd9d6e62c';
 
 
@@ -1844,13 +1844,15 @@ function submitCheckIn(value, source) {
       updateButtons();
 
       /*
-       * 儀表板數字跟著 checkin 一起回來了，
-       * 不用再多打一趟 data。
+       * 快速路徑不回 stats（省下掃全表），
+       * 這裡自己把數字補上；下一次 data 會校正回來。
        */
       if (result && result.stats) {
         currentStats = result.stats;
         lastSyncAt = Date.now();
         renderDashboard();
+      } else if (result && result.ok) {
+        bumpStatsLocally(result);
       }
 
       handleCheckInResult(result);
@@ -1876,10 +1878,43 @@ function submitCheckIn(value, source) {
    報到結果
    ========================================================= */
 
-function showRoundTrip() {
-  if (lastRoundTrip) {
-    setDiag('伺服器來回 ' + (lastRoundTrip / 1000).toFixed(1) + ' 秒');
+/*
+ * 本地累加儀表板數字，不用再跟伺服器要一次。
+ */
+function bumpStatsLocally(result) {
+
+  if (!currentStats) currentStats = { total: 0, present: 0, absents: [] };
+  if (!currentStats.absents) currentStats.absents = [];
+
+  if (result.type === 'temporary') {
+    currentStats.total = (currentStats.total || 0) + 1;
+    currentStats.present = (currentStats.present || 0) + 1;
+  } else if (result.type === 'success') {
+    currentStats.present = (currentStats.present || 0) + 1;
+
+    const i = currentStats.absents.indexOf(result.name);
+    if (i >= 0) currentStats.absents.splice(i, 1);
   }
+
+  renderDashboard();
+}
+
+
+function showRoundTrip(result) {
+
+  if (!lastRoundTrip) return;
+
+  let text = '來回 ' + (lastRoundTrip / 1000).toFixed(1) + ' 秒';
+
+  if (result && typeof result.t === 'number') {
+    const net = Math.max(0, lastRoundTrip - result.t);
+    text += '（試算表 ' + (result.t / 1000).toFixed(1) +
+            ' 秒 ＋ 網路 ' + (net / 1000).toFixed(1) + ' 秒';
+    text += result.fast ? '，走快取' : '，重建快取';
+    text += '）';
+  }
+
+  setDiag(text);
 }
 
 
@@ -1900,7 +1935,7 @@ function handleCheckInResult(result) {
     );
     playSound('success');
     vibrateSuccess();
-    showRoundTrip();
+    showRoundTrip(result);
     pauseAfterResult();
     return;
   }
@@ -1909,6 +1944,7 @@ function handleCheckInResult(result) {
     showUI('臨時人員加入成功', result.name + '\n座位：' + result.seat, 'warn');
     playSound('success');
     vibrateSuccess();
+    showRoundTrip(result);
     pauseAfterResult();
     return;
   }
@@ -1917,6 +1953,7 @@ function handleCheckInResult(result) {
     showUI('重複報到', result.name + '\n座位：' + result.seat, 'error');
     playSound('error');
     vibrateError();
+    showRoundTrip(result);
     pauseAfterResult();
     return;
   }
@@ -1925,6 +1962,7 @@ function handleCheckInResult(result) {
     showUI('堂數不足', result.name + '\n剩餘可用堂數為 0', 'error');
     playSound('error');
     vibrateError();
+    showRoundTrip(result);
     pauseAfterResult();
     return;
   }
