@@ -567,8 +567,14 @@ const BATCH_MAX = 15;
 const DRAIN_DELAY_MS = 400;     // 連續掃描時稍等一下，讓多筆併成一趟
 const RETRY_DELAY_MS = 4000;
 
-/* 閒著沒事時重新抓一次名單，讓多台裝置的數字對得上 */
-const SYNC_INTERVAL_MS = 60000;
+/* 閒著沒事時重新抓一次名單（兩台手機互相同步靠這個） */
+const SYNC_INTERVAL_MS = 45000;
+
+/*
+ * 名單超過這個時間沒更新，下一次批次送出就順便要一份新的。
+ * 多台手機一起報到時，這是它們互相看見對方的管道。
+ */
+const ROSTER_MAX_AGE_MS = 30000;
 
 let isProcessing = false;   // 正在送出報到
 let photoBusy = false;      // 正在解照片
@@ -795,14 +801,14 @@ function changeCourse() {
   syncInterval = setInterval(function () {
     // 掃描/送出中或分頁在背景時跳過，不跟報到搶速度
     /*
-     * 掃描中不做背景更新。
+     * 有東西要送、或正在等回應時不更新，
+     * 免得跟報到搶 Apps Script 的執行序。
      *
-     * Apps Script 同一個使用者的執行是排隊的，
-     * 背景那趟全表掃描會卡住正在等的報到。
-     * 數字本來就會跟著每次報到一起回來。
+     * 但「掃描中而佇列是空的」要更新——
+     * 那是兩台手機互相看見對方的唯一管道。
      */
-    if (isProcessing || photoBusy || scanning || document.hidden) return;
-    if (queue.length || draining) return;   // 還有東西沒送出時不要蓋掉本地狀態
+    if (isProcessing || photoBusy || document.hidden) return;
+    if (queue.length || draining) return;
     fetchCourseData(true);
   }, SYNC_INTERVAL_MS);
 
@@ -826,6 +832,31 @@ function buildRosterIndex() {
 }
 
 
+/*
+ * 套用伺服器來的新名單。
+ *
+ * 佇列裡還沒寫進 Sheet 的那幾筆，伺服器當然不知道，
+ * 所以要疊回去，否則畫面會倒退成「還沒報到」。
+ */
+function applyRoster(list) {
+
+  if (!Array.isArray(list)) return;
+
+  roster = list;
+  buildRosterIndex();
+
+  queue.forEach(function (item) {
+    const e = rosterIndex.get(item.v);
+    if (e && !e.d) {
+      e.d = 1;
+      if (e.r > 0) e.r = e.r - 1;
+    }
+  });
+
+  lastSyncAt = Date.now();
+}
+
+
 function fetchCourseData(silent) {
 
   if (!currentCourse) return;
@@ -842,9 +873,7 @@ function fetchCourseData(silent) {
       if (requestedCourse !== currentCourse) return;
 
       if (res && res.ok && Array.isArray(res.roster)) {
-        roster = res.roster;
-        buildRosterIndex();
-        lastSyncAt = Date.now();
+        applyRoster(res.roster);
       }
 
       renderDashboard();
@@ -933,10 +962,13 @@ function drain() {
   draining = true;
   renderPending();
 
+  const needRoster = (Date.now() - lastSyncAt) > ROSTER_MAX_AGE_MS ? 1 : 0;
+
   api({
     action: 'checkin_batch',
     course: course,
-    values: JSON.stringify(batch.map(function (x) { return x.v; }))
+    values: JSON.stringify(batch.map(function (x) { return x.v; })),
+    withRoster: needRoster
   })
 
     .then(function (res) {
@@ -949,6 +981,13 @@ function drain() {
         });
 
         reconcile(res.results);
+
+        // 伺服器捎回最新名單就套用，讓多台裝置的數字對得上
+        if (Array.isArray(res.roster)) {
+          applyRoster(res.roster);
+          renderDashboard();
+        }
+
         drainFailed = false;
 
       } else {
