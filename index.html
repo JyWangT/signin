@@ -110,10 +110,7 @@
     }
 
     /* 掃描進行中，把當下用不到的東西收起來，縮短頁面 */
-    body.scanning-mode #btnCamera,
-    body.scanning-mode #btnAlbum,
     body.scanning-mode .hint,
-    body.scanning-mode #previewBox,
     body.scanning-mode #decodedPanel {
       display: none !important;
     }
@@ -211,20 +208,6 @@
       color: #777;
       line-height: 1.6;
       margin: 4px 0 14px 0;
-    }
-
-    #previewBox {
-      width: 100%;
-      display: none;
-      margin-bottom: 12px;
-      text-align: center;
-    }
-
-    #previewImg {
-      max-width: 100%;
-      max-height: 220px;
-      border-radius: 8px;
-      border: 1px solid #ddd;
     }
 
     .manual-label {
@@ -435,27 +418,9 @@
         <input type="range" id="zoom">
       </div>
 
-      <button class="camera-button secondary" id="btnCamera" onclick="pickPhoto('camera')">
-        📸 改用拍照識別
-      </button>
-
-      <button class="camera-button secondary" id="btnAlbum" onclick="pickPhoto('album')">
-        🖼️ 從相簿選擇照片
-      </button>
-
-      <input id="qrPhotoCamera" type="file" accept="image/*" capture="environment"
-             onchange="scanQrPhoto(event)" hidden>
-
-      <input id="qrPhotoAlbum" type="file" accept="image/*"
-             onchange="scanQrPhoto(event)" hidden>
-
       <div class="hint">
         相機會一直開著，一個接一個掃，不用按任何按鈕。<br>
-        相機開不起來時，改用下面的拍照識別。
-      </div>
-
-      <div id="previewBox">
-        <img id="previewImg" alt="拍攝的照片">
+        相機開不起來時，用下面的欄位手動輸入姓名。
       </div>
 
       <div id="decodedPanel" hidden style="width:100%;margin:8px 0 16px">
@@ -508,6 +473,31 @@
 
     </div>
 
+  </div>
+
+
+  <!-- ========== 名單外人員確認 ========== -->
+  <div id="tempModal" class="modal-overlay">
+    <div class="modal-box" style="width:380px">
+      <h3 style="margin-top:0;color:#d9534f;">名單中沒有這個人</h3>
+
+      <div style="font-size:13px;color:#777;margin-bottom:6px;text-align:left;">掃到／輸入的內容：</div>
+      <pre id="tempValue" style="white-space:pre-wrap;overflow-wrap:anywhere;font-size:20px;
+           background:#f1f6fb;padding:12px;border-radius:8px;margin:0 0 6px 0;text-align:left;
+           user-select:text;max-height:120px;overflow:auto"></pre>
+      <div id="tempCourse" style="font-size:13px;color:#777;margin-bottom:14px;text-align:left;"></div>
+
+      <div style="font-size:13px;color:#8a6d00;background:#fff8e1;padding:10px;
+                  border-radius:6px;text-align:left;line-height:1.6;margin-bottom:14px;">
+        如果上面是亂碼或看起來不對，請按取消——那多半是 QR 沒讀好。
+        按確定會在 Sheet 新增一列臨時人員。
+      </div>
+
+      <div>
+        <button class="modal-btn btn-confirm" onclick="confirmTemp()">確定加入</button>
+        <button class="modal-btn btn-cancel" onclick="cancelTemp()">取消</button>
+      </div>
+    </div>
   </div>
 
 
@@ -598,7 +588,6 @@ const ROSTER_MAX_AGE_MS = 15000;
 const ROSTER_STALE_MS = 25000;
 
 let isProcessing = false;   // 正在送出報到
-let photoBusy = false;      // 正在解照片
 let scanning = false;       // 相機即時掃描中
 
 let lastPreviewUrl = null;
@@ -717,21 +706,29 @@ function loadCourses() {
         select.appendChild(option);
       });
 
-      // 把本機新增過的臨時課程補回選單
+      // 伺服器真的有的課程（Sheet 裡至少有一列）
+      const serverCourses = (res.courses || []).slice();
+
+      // 本機新增過、但 Sheet 還沒有任何人的臨時課程
       getCustomCourses().forEach(function (course) {
         if (!optionExists(select, course)) {
           const option = document.createElement('option');
           option.value = course;
-          option.textContent = course;
+          option.textContent = course + '（本機新增）';
           select.appendChild(option);
         }
       });
 
-      // 記住上次用的課程
+      /*
+       * 只有「伺服器也有的課程」才自動選回去。
+       *
+       * 本機自建的臨時課程（例如測試時打的 123）如果自動選中，
+       * 工作人員沒注意就會把整場報到寫到錯的課程底下。
+       */
       let saved = '';
       try { saved = localStorage.getItem('lastCourse') || ''; } catch (e) {}
 
-      if (saved && optionExists(select, saved)) {
+      if (saved && serverCourses.indexOf(saved) >= 0) {
         select.value = saved;
         changeCourse();
       } else {
@@ -786,7 +783,6 @@ function changeCourse() {
   button.textContent = '展開未到名單';
   button.style.backgroundColor = '#2196F3';
 
-  clearPreview();
   document.getElementById('decodedPanel').hidden = true;
   document.getElementById('decodedText').textContent = '';
   setDiag('');
@@ -826,7 +822,7 @@ function changeCourse() {
 
   syncInterval = setInterval(function () {
 
-    if (isProcessing || photoBusy || document.hidden) return;
+    if (isProcessing || document.hidden) return;
 
     /*
      * 忙的時候 5 秒跟 Sheet 對一次，閒的時候 45 秒。
@@ -911,12 +907,12 @@ function fetchCourseData(silent) {
 
       const input = document.getElementById('qrInput');
 
-      if (input.disabled && !isProcessing && !photoBusy) {
+      if (input.disabled && !isProcessing) {
         input.disabled = false;
         input.placeholder = '請輸入 QR Code 或姓名...';
       }
 
-      if (!silent && !isProcessing && !photoBusy) {
+      if (!silent && !isProcessing) {
         showUI('準備就緒', '按「開始即時掃描」，或手動輸入', '');
       }
 
@@ -1169,11 +1165,11 @@ function renderPending() {
      * 所以名單新鮮度另外講，不要混為一談。
      */
     lines = ['✅ 這台掃的都已寫入 Sheet'];
-   /*
-   * if (lastWriteOkAt) {
-   *   lines.push('最後寫入 ' + fmtClock(lastWriteOkAt));
-   * }
-     */
+
+    if (lastWriteOkAt) {
+      lines.push('最後寫入 ' + fmtClock(lastWriteOkAt));
+    }
+
     if (lastSyncAt) {
 
       const age = Date.now() - lastSyncAt;
@@ -1296,7 +1292,7 @@ function toggleScan() {
 async function startScan() {
 
   if (!currentCourse) { showUI('請先選擇課程', '', 'warn'); return; }
-  if (photoBusy || isProcessing) return;
+  if (isProcessing) return;
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     showUI('此瀏覽器不支援相機', '請改用拍照識別或手動輸入', 'error');
@@ -1470,7 +1466,8 @@ async function loop() {
   if (now - lastTick < 90) return;   // 約 11 fps
   lastTick = now;
 
-  if (isProcessing || photoBusy) return;
+  if (isProcessing) return;
+  if (pendingTemp) return;          // 有東西等著確認，先不接新的
 
   const video = document.getElementById('video');
   if (video.readyState < 2 || !video.videoWidth) return;
@@ -1543,263 +1540,6 @@ async function loop() {
 
 
 
-/* =========================================================
-   照片 QR 辨識引擎（相機開不起來時的後備）
-   ========================================================= */
-
-let attemptCount = 0;
-let diagLines = [];
-let lastBitmap = null;
-
-function sleep(ms) {
-  return new Promise(function (r) { setTimeout(r, ms); });
-}
-
-
-async function loadImageSource(file) {
-
-  if (typeof createImageBitmap === 'function') {
-    try {
-      return await createImageBitmap(file, { imageOrientation: 'from-image' });
-    } catch (e) {
-      try {
-        return await createImageBitmap(file);
-      } catch (e2) {}
-    }
-  }
-
-  const url = URL.createObjectURL(file);
-  const img = new Image();
-
-  try {
-    await new Promise(function (resolve, reject) {
-      const timer = setTimeout(function () {
-        reject(new Error('讀取照片逾時（20 秒）'));
-      }, 20000);
-
-      img.onload = function () { clearTimeout(timer); resolve(); };
-      img.onerror = function () {
-        clearTimeout(timer);
-        reject(new Error('瀏覽器無法解碼此照片格式：' + (file.type || '未知')));
-      };
-      img.src = url;
-    });
-  } finally {
-    setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
-  }
-
-  return img;
-}
-
-
-function srcWidth(src) { return src.naturalWidth || src.width; }
-function srcHeight(src) { return src.naturalHeight || src.height; }
-
-
-const workCanvas = document.createElement('canvas');
-const workCtx = workCanvas.getContext('2d', { willReadFrequently: true });
-
-const stepCanvas = document.createElement('canvas');
-const stepCtx = stepCanvas.getContext('2d');
-
-const MAX_STEP_SIDE = 2048;
-
-
-function drawRegion(src, sx, sy, sw, sh, targetMax) {
-
-  const scale = Math.min(1, targetMax / Math.max(sw, sh));
-  const dw = Math.max(1, Math.round(sw * scale));
-  const dh = Math.max(1, Math.round(sh * scale));
-
-  workCanvas.width = dw;
-  workCanvas.height = dh;
-  workCtx.imageSmoothingEnabled = true;
-  workCtx.imageSmoothingQuality = 'high';
-  workCtx.fillStyle = '#fff';
-  workCtx.fillRect(0, 0, dw, dh);
-
-  if (scale >= 0.5) {
-
-    workCtx.drawImage(src, sx, sy, sw, sh, 0, 0, dw, dh);
-
-  } else {
-
-    const stepScale = Math.min(1, MAX_STEP_SIDE / Math.max(sw, sh));
-
-    let cw = Math.max(dw, Math.round(sw * stepScale));
-    let ch = Math.max(dh, Math.round(sh * stepScale));
-
-    stepCanvas.width = cw;
-    stepCanvas.height = ch;
-    stepCtx.imageSmoothingEnabled = true;
-    stepCtx.imageSmoothingQuality = 'high';
-    stepCtx.drawImage(src, sx, sy, sw, sh, 0, 0, cw, ch);
-
-    while (cw / 2 > dw && ch / 2 > dh) {
-      const nw = Math.max(dw, Math.round(cw / 2));
-      const nh = Math.max(dh, Math.round(ch / 2));
-      stepCtx.drawImage(stepCanvas, 0, 0, cw, ch, 0, 0, nw, nh);
-      cw = nw;
-      ch = nh;
-    }
-
-    workCtx.drawImage(stepCanvas, 0, 0, cw, ch, 0, 0, dw, dh);
-
-    stepCanvas.width = 1;
-    stepCanvas.height = 1;
-  }
-
-  return workCtx.getImageData(0, 0, dw, dh);
-}
-
-
-function safeDrawRegion(src, sx, sy, sw, sh, targetMax) {
-  try {
-    return drawRegion(src, sx, sy, sw, sh, targetMax);
-  } catch (e) {
-    return null;
-  }
-}
-
-
-function toGray(imageData) {
-  const d = imageData.data;
-  const n = imageData.width * imageData.height;
-  const g = new Uint8ClampedArray(n);
-
-  for (let i = 0, j = 0; i < n; i++, j += 4) {
-    g[i] = (d[j] * 0.299 + d[j + 1] * 0.587 + d[j + 2] * 0.114) | 0;
-  }
-  return g;
-}
-
-
-function grayToImageData(g, w, h) {
-  const out = workCtx.createImageData(w, h);
-  const d = out.data;
-
-  for (let i = 0, j = 0; i < g.length; i++, j += 4) {
-    d[j] = d[j + 1] = d[j + 2] = g[i];
-    d[j + 3] = 255;
-  }
-  return out;
-}
-
-
-function contrastStretch(g) {
-
-  const hist = new Uint32Array(256);
-  for (let i = 0; i < g.length; i++) hist[g[i]]++;
-
-  const total = g.length;
-  const cut = Math.max(1, Math.round(total * 0.02));
-
-  let lo = 0, hi = 255, acc = 0;
-
-  for (let v = 0; v < 256; v++) {
-    acc += hist[v];
-    if (acc >= cut) { lo = v; break; }
-  }
-
-  acc = 0;
-  for (let v = 255; v >= 0; v--) {
-    acc += hist[v];
-    if (acc >= cut) { hi = v; break; }
-  }
-
-  if (hi - lo < 10) return g;
-
-  const out = new Uint8ClampedArray(g.length);
-  const range = hi - lo;
-
-  for (let i = 0; i < g.length; i++) {
-    out[i] = ((g[i] - lo) * 255 / range);
-  }
-  return out;
-}
-
-
-function otsuBinarize(g) {
-
-  const hist = new Uint32Array(256);
-  for (let i = 0; i < g.length; i++) hist[g[i]]++;
-
-  const total = g.length;
-  let sum = 0;
-  for (let v = 0; v < 256; v++) sum += v * hist[v];
-
-  let sumB = 0, wB = 0, best = 0, threshold = 128;
-
-  for (let v = 0; v < 256; v++) {
-    wB += hist[v];
-    if (wB === 0) continue;
-
-    const wF = total - wB;
-    if (wF === 0) break;
-
-    sumB += v * hist[v];
-
-    const mB = sumB / wB;
-    const mF = (sum - sumB) / wF;
-    const between = wB * wF * (mB - mF) * (mB - mF);
-
-    if (between > best) { best = between; threshold = v; }
-  }
-
-  const out = new Uint8ClampedArray(g.length);
-  for (let i = 0; i < g.length; i++) out[i] = g[i] > threshold ? 255 : 0;
-
-  return out;
-}
-
-
-function adaptiveBinarize(g, w, h, winFrac, t) {
-
-  winFrac = winFrac || 0.125;
-  t = (t === undefined) ? 0.12 : t;
-
-  const S = Math.max(8, Math.round(Math.min(w, h) * winFrac));
-  const half = S >> 1;
-
-  const iw = w + 1;
-  const integral = new Float64Array(iw * (h + 1));
-
-  for (let y = 0; y < h; y++) {
-    let rowSum = 0;
-    for (let x = 0; x < w; x++) {
-      rowSum += g[y * w + x];
-      integral[(y + 1) * iw + (x + 1)] = integral[y * iw + (x + 1)] + rowSum;
-    }
-  }
-
-  const out = new Uint8ClampedArray(w * h);
-
-  for (let y = 0; y < h; y++) {
-
-    const y1 = Math.max(0, y - half);
-    const y2 = Math.min(h - 1, y + half);
-
-    for (let x = 0; x < w; x++) {
-
-      const x1 = Math.max(0, x - half);
-      const x2 = Math.min(w - 1, x + half);
-
-      const count = (x2 - x1 + 1) * (y2 - y1 + 1);
-
-      const sum =
-        integral[(y2 + 1) * iw + (x2 + 1)] -
-        integral[y1 * iw + (x2 + 1)] -
-        integral[(y2 + 1) * iw + x1] +
-        integral[y1 * iw + x1];
-
-      out[y * w + x] = (g[y * w + x] * count <= sum * (1 - t)) ? 0 : 255;
-    }
-  }
-
-  return out;
-}
-
-
 /* ---- Big5 / GBK 中文修正 ----
  * jsQR 只用 UTF-8 解 byte mode，中文 QR 會回傳空字串。
  */
@@ -1807,6 +1547,26 @@ function adaptiveBinarize(g, w, h, winFrac, t) {
 const COMMON_HANZI = '的一是不了在人有我他这个们中来上大为和国地到以说时要就出会可也你对生能而子那得于着下自之年过发后作里用道行所然家种事成方多经么去法学如都同现当没动面起看定天分还进好小部其些主样理心她本前开但因只从想实日军者意无力它与长把机十民第公此已工使情明性知全三又关点正业外将两高间由问很最重并物手应战向头文体政美相见被利什二等产或新己制身果加西斯月话合回特代内信表化老给世位次度门任常先海通教儿原东声提立及比员解水名真论处走义各入几口认条平系气题活尔更别打女变四神总何电数安少报才结反受目太量再感建务做接必场件计管期市直德资命山金指克许统区保至队形社便空决治展马科司五基眼书非则听白却界达光放强即像难且权思王象完设式色路记南品住告类求据程北边死张该交规万取拉格望觉术领共确传师观清今切院让识候带导争运笑飞风步改收根干造言联持组每济车亲极林服快办议往元英士证近失转夫令准布始怎呢存未远叫台单影具罗字爱击流备兵连调深商算质团集百需价花党华城石级整府离况亚请技际约示复病息究线似官火断精满支视消越器容照须九增研写称企八功严课黄杨赵吴周徐孙朱胡郭梁郑宋谢唐韩曹邓萧冯曾蔡彭潘袁董余苏叶吕魏蒋田杜丁沈姜范江傅钟卢汪戴崔陆廖姚邱夏谭韦贾邹熊孟秦阎薛侯雷龙段郝孔邵史毛顾赖武康贺尹钱施牛洪龚伟刘學國會來時個們對這樣經過還發後與長開間進實現當種頭問幾點業體車東馬麼義門張說話語書畫圖為無萬麗鄉聲藝響應該權導總結課報產處證務員師機關係統選擇劉華偉陳黃楊趙吳孫鄭羅謝韓許鄧蕭馮餘蘇葉呂蔣鍾盧陸譚韋賈鄒閻龍顧賴嚴錢龔怡君並讓認識豐線靈壽豔臺灣號碼簽';
 
 let lastEncodingUsed = '';
+
+/*
+ * 這條路是「jsQR 有讀到 QR、但文字解不出來」時的後備猜測。
+ * 猜錯就會生出來路不明的臨時人員，所以結果要先過一道合理性檢查。
+ */
+function plausibleText(text) {
+
+  if (!text) return false;
+
+  const t = String(text).trim();
+
+  // 一個字幾乎都是雜訊被硬解成常用字
+  if (t.length < 2) return false;
+
+  // 正常的 QR 內容不會有控制字元
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(t)) return false;
+
+  return true;
+}
+
 
 function bytesToText(bytes) {
 
@@ -1816,7 +1576,7 @@ function bytesToText(bytes) {
 
   try {
     const s = new TextDecoder('utf-8', { fatal: true }).decode(arr).trim();
-    if (s) { lastEncodingUsed = 'utf-8'; return s; }
+    if (plausibleText(s)) { lastEncodingUsed = 'utf-8'; return s; }
   } catch (e) {}
 
   const encodings = ['big5', 'gb18030', 'shift_jis', 'euc-kr', 'windows-1252'];
@@ -1855,7 +1615,13 @@ function bytesToText(bytes) {
     } catch (e) {}
   }
 
-  if (best) { lastEncodingUsed = bestEnc; return best; }
+  /*
+   * 這條路是「jsQR 有讀到 QR、但文字解不出來」時的後備猜測，
+   * 猜錯就會生出莫名其妙的臨時人員。
+   *
+   * 只有一個字的結果幾乎都是雜訊被硬解成常用字，直接不要。
+   */
+  if (plausibleText(best)) { lastEncodingUsed = bestEnc; return best; }
 
   let ascii = '';
   for (let i = 0; i < arr.length; i++) {
@@ -1863,189 +1629,13 @@ function bytesToText(bytes) {
   }
   ascii = ascii.trim();
 
-  if (ascii) { lastEncodingUsed = 'ascii-fallback'; return ascii; }
+  if (ascii.length >= 3 && plausibleText(ascii)) {
+    lastEncodingUsed = 'ascii-fallback';
+    return ascii;
+  }
 
   return null;
 }
-
-
-function tryJsQR(imageData) {
-
-  try {
-    const r = jsQR(imageData.data, imageData.width, imageData.height, {
-      inversionAttempts: 'attemptBoth'
-    });
-
-    attemptCount++;
-
-    if (!r) return null;
-
-    const direct = (r.data || '').trim();
-    if (direct) { lastEncodingUsed = 'utf-8'; return direct; }
-
-    return bytesToText(r.binaryData);
-
-  } catch (e) {
-    attemptCount++;
-    return null;
-  }
-}
-
-
-async function decodeImageData(imageData, variants) {
-
-  const w = imageData.width;
-  const h = imageData.height;
-
-  let hit = tryJsQR(imageData);
-  if (hit) return hit;
-
-  if (!variants) return null;
-
-  const gray = toGray(imageData);
-
-  await sleep(0);
-
-  const ad1 = adaptiveBinarize(gray, w, h, 0.125, 0.12);
-  hit = tryJsQR(grayToImageData(ad1, w, h));
-  if (hit) return hit;
-
-  await sleep(0);
-
-  const ad2 = adaptiveBinarize(gray, w, h, 0.25, 0.08);
-  hit = tryJsQR(grayToImageData(ad2, w, h));
-  if (hit) return hit;
-
-  await sleep(0);
-
-  const cs = contrastStretch(gray);
-  hit = tryJsQR(grayToImageData(cs, w, h));
-  if (hit) return hit;
-
-  await sleep(0);
-
-  hit = tryJsQR(grayToImageData(otsuBinarize(cs), w, h));
-  if (hit) return hit;
-
-  return null;
-}
-
-
-async function tryNativeDetect(source) {
-
-  const det = await getDetector();
-  if (!det) return null;
-
-  try {
-    const codes = await det.detect(source);
-    attemptCount++;
-    if (codes && codes.length) {
-      for (let i = 0; i < codes.length; i++) {
-        const v = (codes[i].rawValue || '').trim();
-        if (v) { lastEncodingUsed = 'BarcodeDetector'; return v; }
-      }
-    }
-  } catch (e) {
-    attemptCount++;
-  }
-  return null;
-}
-
-
-async function decodeQrPhoto(file, onProgress) {
-
-  if (typeof jsQR !== 'function' && typeof window.BarcodeDetector !== 'function') {
-    throw new Error('QR 識別程式未載入，請檢查網路能不能連到 CDN');
-  }
-
-  attemptCount = 0;
-  diagLines = [];
-  lastEncodingUsed = '';
-
-  const src = await loadImageSource(file);
-
-  if (typeof ImageBitmap !== 'undefined' && src instanceof ImageBitmap) {
-    lastBitmap = src;
-  }
-
-  const W = srcWidth(src);
-  const H = srcHeight(src);
-
-  if (!W || !H) throw new Error('照片沒有有效尺寸');
-
-  diagLines.push('照片尺寸：' + W + ' × ' + H + '（' + Math.round(file.size / 1024) + ' KB，' + (file.type || '未知格式') + '）');
-
-  showPreview(file);
-
-  let hit = null;
-
-  onProgress('使用系統內建偵測器...');
-  hit = await tryNativeDetect(src);
-  if (hit) { diagLines.push('由系統 BarcodeDetector 解出'); return hit; }
-
-  const fullScales = [1400, 900, 2000, 600, 2800];
-
-  for (let i = 0; i < fullScales.length; i++) {
-
-    onProgress('分析整張照片 (' + (i + 1) + '/' + fullScales.length + ')...');
-    await sleep(0);
-
-    const target = Math.min(fullScales[i], Math.max(W, H));
-    const data = safeDrawRegion(src, 0, 0, W, H, target);
-    if (!data) continue;
-
-    hit = await decodeImageData(data, true);
-    if (hit) { diagLines.push('整張照片 @' + target + 'px 解出'); return hit; }
-
-    hit = await tryNativeDetect(workCanvas);
-    if (hit) { diagLines.push('BarcodeDetector @' + target + 'px 解出'); return hit; }
-  }
-
-  const side = Math.min(W, H);
-  const centerCrops = [0.75, 0.55, 0.4, 0.28];
-
-  for (let i = 0; i < centerCrops.length; i++) {
-
-    onProgress('放大中央區域 (' + (i + 1) + '/' + centerCrops.length + ')...');
-    await sleep(0);
-
-    const n = side * centerCrops[i];
-    const sx = (W - n) / 2;
-    const sy = (H - n) / 2;
-
-    const data = safeDrawRegion(src, sx, sy, n, n, 1200);
-    if (!data) continue;
-
-    hit = await decodeImageData(data, true);
-    if (hit) { diagLines.push('中央 ' + Math.round(centerCrops[i] * 100) + '% 區域解出'); return hit; }
-
-    hit = await tryNativeDetect(workCanvas);
-    if (hit) { diagLines.push('BarcodeDetector 中央區域解出'); return hit; }
-  }
-
-  const grid = [0, 0.25, 0.5];
-  const tile = 0.5;
-  let tileIndex = 0;
-
-  for (let gy = 0; gy < grid.length; gy++) {
-    for (let gx = 0; gx < grid.length; gx++) {
-
-      tileIndex++;
-      onProgress('掃描分割區塊 (' + tileIndex + '/9)...');
-      await sleep(0);
-
-      const data = safeDrawRegion(src, W * grid[gx], H * grid[gy], W * tile, H * tile, 1100);
-      if (!data) continue;
-
-      hit = await decodeImageData(data, true);
-      if (hit) { diagLines.push('分割區塊 ' + tileIndex + ' 解出'); return hit; }
-    }
-  }
-
-  diagLines.push('共嘗試 ' + attemptCount + ' 種解碼方式，全部失敗');
-  throw new Error('照片中找不到可解讀的 QR Code');
-}
-
 
 
 /* =========================================================
@@ -2054,7 +1644,7 @@ async function decodeQrPhoto(file, onProgress) {
 
 function updateButtons() {
 
-  const busy = isProcessing || photoBusy;
+  const busy = isProcessing;
   const noCourse = !currentCourse;
 
   /*
@@ -2064,140 +1654,14 @@ function updateButtons() {
    * 那段時間按鈕是 disabled 的，按下去完全沒反應。
    */
   document.getElementById('btnScan').disabled = noCourse || (busy && !scanning);
-  document.getElementById('btnCamera').disabled = busy || noCourse || scanning;
-  document.getElementById('btnAlbum').disabled = busy || noCourse || scanning;
   document.getElementById('btnNewCourse').disabled = busy;
   document.getElementById('courseSelect').disabled = busy;
-}
-
-
-function showPreview(file) {
-  clearPreview();
-  lastPreviewUrl = URL.createObjectURL(file);
-  document.getElementById('previewImg').src = lastPreviewUrl;
-  document.getElementById('previewBox').style.display = 'block';
-}
-
-
-function clearPreview() {
-  if (lastPreviewUrl) {
-    URL.revokeObjectURL(lastPreviewUrl);
-    lastPreviewUrl = null;
-  }
-  document.getElementById('previewBox').style.display = 'none';
-  document.getElementById('previewImg').removeAttribute('src');
 }
 
 
 function setDiag(text) {
   document.getElementById('diagDisplay').textContent = text || '';
 }
-
-
-function pickPhoto(mode) {
-
-  if (!currentCourse) {
-    showUI('請先選擇課程', '', 'warn');
-    return;
-  }
-
-  if (photoBusy || isProcessing || scanning) return;
-
-  document.getElementById(
-    mode === 'album' ? 'qrPhotoAlbum' : 'qrPhotoCamera'
-  ).click();
-}
-
-
-async function scanQrPhoto(event) {
-
-  const file = event.target.files[0];
-  event.target.value = '';
-
-  if (!file || photoBusy || isProcessing || !currentCourse) return;
-
-  const course = currentCourse;
-
-  photoBusy = true;
-  updateButtons();
-
-  document.getElementById('decodedPanel').hidden = true;
-  document.getElementById('decodedText').textContent = '';
-  document.getElementById('qrInput').value = '';
-  setDiag('');
-
-  const started = Date.now();
-
-  try {
-
-    showUI('正在辨識照片', '請稍候...', 'warn');
-
-    const value = await decodeQrPhoto(file, function (msg) {
-      document.getElementById('subDisplay').textContent = msg;
-    });
-
-    if (currentCourse !== course) {
-      throw new Error('課程已變更，請重新拍照');
-    }
-
-    document.getElementById('decodedText').textContent = value;
-    document.getElementById('decodedPanel').hidden = false;
-    document.getElementById('qrInput').value = value;
-
-    diagLines.push('文字編碼：' + (lastEncodingUsed || '未知'));
-    diagLines.push('耗時 ' + ((Date.now() - started) / 1000).toFixed(1) + ' 秒');
-    setDiag(diagLines.join('\n'));
-
-    releaseCanvases();
-    photoBusy = false;
-    updateButtons();
-
-    submitCheckIn(value, 'photo');
-    return;
-
-  } catch (error) {
-
-    diagLines.push('耗時 ' + ((Date.now() - started) / 1000).toFixed(1) + ' 秒');
-    setDiag(diagLines.join('\n') + '\n' + errorText(error));
-
-    showUI(
-      '照片辨識失敗',
-      '請靠近一點、讓 QR 填滿畫面並對焦清楚，\n或直接用下方手動輸入。',
-      'error'
-    );
-
-    playSound('error');
-    vibrateError();
-
-  } finally {
-    releaseCanvases();
-    photoBusy = false;
-    updateButtons();
-  }
-}
-
-
-function releaseCanvases() {
-  try {
-    workCanvas.width = 1;
-    workCanvas.height = 1;
-    stepCanvas.width = 1;
-    stepCanvas.height = 1;
-
-    if (lastBitmap && typeof lastBitmap.close === 'function') {
-      lastBitmap.close();
-    }
-    lastBitmap = null;
-  } catch (e) {}
-}
-
-
-function errorText(error) {
-  if (!error) return '未知錯誤';
-  if (error.message) return (error.name ? error.name + ': ' : '') + error.message;
-  return String(error);
-}
-
 
 
 /* =========================================================
@@ -2236,6 +1700,7 @@ function handleEnter(event) {
 function submitCheckIn(value, source) {
 
   if (isProcessing) return;
+  if (pendingTemp) return;
 
   if (!currentCourse) {
     showUI('請先選擇課程', '', 'warn');
@@ -2287,7 +1752,59 @@ function submitCheckIn(value, source) {
   }
 
 
-  /* ---------- 名單外：要等伺服器 ---------- */
+  /* ---------- 名單外：先問過人再寫 ---------- */
+
+  askTemp(value);
+}
+
+
+/*
+ * 名單裡沒有的內容，一律要人確認才寫進 Sheet。
+ *
+ * 之前是直接建立臨時人員，結果 QR 誤判或手滑打錯，
+ * Sheet 就會多出「好 / 123 / 臨時劃位」這種來路不明的列。
+ */
+let pendingTemp = null;
+
+function askTemp(value) {
+
+  pendingTemp = { value: value, course: currentCourse };
+
+  document.getElementById('tempValue').textContent = value;
+  document.getElementById('tempCourse').textContent = '課程：' + currentCourse;
+  document.getElementById('tempModal').style.display = 'flex';
+
+  showUI('名單中沒有這個人', '請確認畫面上的內容', 'warn');
+  playSound('error');
+  vibrateError();
+}
+
+
+function cancelTemp() {
+  pendingTemp = null;
+  document.getElementById('tempModal').style.display = 'none';
+  showUI('已取消', '沒有寫入任何資料', '');
+  setDiag('');
+  lastCode = '';
+  focusScanner();
+}
+
+
+function confirmTemp() {
+
+  if (!pendingTemp) return;
+
+  const value = pendingTemp.value;
+  const course = pendingTemp.course;
+
+  pendingTemp = null;
+  document.getElementById('tempModal').style.display = 'none';
+
+  sendTemp(value, course);
+}
+
+
+function sendTemp(value, course) {
 
   const input = document.getElementById('qrInput');
 
@@ -2295,7 +1812,7 @@ function submitCheckIn(value, source) {
   input.disabled = true;
   updateButtons();
 
-  showUI('處理中...', '名單裡沒有，連線確認中…', 'warn');
+  showUI('處理中...', '新增臨時人員中…', 'warn');
 
   const t0 = Date.now();
 
@@ -2305,7 +1822,7 @@ function submitCheckIn(value, source) {
     document.getElementById('subDisplay').textContent = '連線中… ' + secs + ' 秒';
   }, 200);
 
-  api({ action: 'checkin', course: currentCourse, value: value })
+  api({ action: 'checkin', course: course, value: value })
 
     .then(function (result) {
 
@@ -2492,7 +2009,7 @@ function toggleAbsents() {
 
 function openModal() {
 
-  if (isProcessing || photoBusy) return;
+  if (isProcessing) return;
 
   document.getElementById('courseModal').style.display = 'flex';
 
@@ -2632,7 +2149,7 @@ function isTouchDevice() {
 function focusScanner() {
 
   if (isTouchDevice()) return;
-  if (photoBusy || isProcessing) return;
+  if (isProcessing) return;
   if (document.getElementById('courseModal').style.display === 'flex') return;
 
   setTimeout(function () {
@@ -2645,7 +2162,7 @@ function focusScanner() {
 document.addEventListener('click', function (event) {
 
   if (isTouchDevice()) return;
-  if (photoBusy || isProcessing) return;
+  if (isProcessing) return;
 
   const input = document.getElementById('qrInput');
   const tag = event.target.tagName;
