@@ -544,6 +544,7 @@ let syncInterval = null;
 let lastSyncAt = 0;
 let syncing = false;
 let lastRoundTrip = 0;
+let manualStop = false;
 
 /*
  * 儀表板背景更新間隔。
@@ -757,7 +758,14 @@ function changeCourse() {
 
   syncInterval = setInterval(function () {
     // 掃描/送出中或分頁在背景時跳過，不跟報到搶速度
-    if (isProcessing || photoBusy || document.hidden) return;
+    /*
+     * 掃描中不做背景更新。
+     *
+     * Apps Script 同一個使用者的執行是排隊的，
+     * 背景那趟全表掃描會卡住正在等的報到。
+     * 數字本來就會跟著每次報到一起回來。
+     */
+    if (isProcessing || photoBusy || scanning || document.hidden) return;
     fetchCourseData(true);
   }, SYNC_INTERVAL_MS);
 
@@ -843,7 +851,12 @@ async function getDetector() {
 
 
 function toggleScan() {
-  if (scanning) { stopScan(); } else { startScan(); }
+  if (scanning) {
+    manualStop = true;      // 使用者自己按停的，不要被稍後回來的結果改掉
+    stopScan();
+  } else {
+    startScan();
+  }
 }
 
 
@@ -884,6 +897,7 @@ async function startScan() {
     btn.classList.add('scanning');
 
     btn.classList.remove('resume');
+    manualStop = false;
 
     /*
      * 剛剛那個人可能還站在鏡頭前，
@@ -953,7 +967,12 @@ function stopScan(pausedForResult) {
  */
 function pauseAfterResult() {
 
-  if (scanning) stopScan(true);
+  if (scanning) {
+    stopScan(true);
+  } else if (manualStop) {
+    // 使用者按了停止，就維持「開始即時掃描」，不改成「掃描下一位」
+    manualStop = false;
+  }
 
   // 手機螢幕短，把結果捲到看得到的位置
   if (isTouchDevice()) {
@@ -1615,7 +1634,13 @@ function updateButtons() {
   const busy = isProcessing || photoBusy;
   const noCourse = !currentCourse;
 
-  document.getElementById('btnScan').disabled = busy || noCourse;
+  /*
+   * 掃描中的「停止掃描」永遠要能按。
+   *
+   * 之前伺服器慢的時候 isProcessing 會卡 2～5 秒，
+   * 那段時間按鈕是 disabled 的，按下去完全沒反應。
+   */
+  document.getElementById('btnScan').disabled = noCourse || (busy && !scanning);
   document.getElementById('btnCamera').disabled = busy || noCourse || scanning;
   document.getElementById('btnAlbum').disabled = busy || noCourse || scanning;
   document.getElementById('btnNewCourse').disabled = busy;
