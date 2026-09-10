@@ -483,6 +483,8 @@
 
       <h3 style="margin-top:0;margin-bottom:4px;">📊 即時儀表板</h3>
 
+      <div id="pendingBox" style="display:none;font-size:14px;padding:8px 10px;border-radius:6px;margin-bottom:10px;"></div>
+
       <div style="font-size:12px;color:#999;margin-bottom:12px;">
         <span id="syncStamp"></span>
         <button id="btnRefresh" onclick="fetchCourseData(false)"
@@ -530,7 +532,7 @@
    ★ 設定：這兩行改成你自己的
    ========================================================= */
 
-const API_URL   = 'https://script.google.com/macros/s/AKfycbzuYtSpP4G8Xc3Hic44FV-MWZ1F3Yu_xQqKylEVLITIvdC4MjkKPrfM5t6BiX0quC9Q/exec';
+const API_URL   = 'https://script.google.com/macros/s/請貼上你的部署ID/exec';
 const API_TOKEN = '3f350a2c70d6b4dbd9d6e62c';
 
 
@@ -539,7 +541,6 @@ const API_TOKEN = '3f350a2c70d6b4dbd9d6e62c';
    ========================================================= */
 
 let currentCourse = '';
-let currentStats = { total: 0, present: 0, absents: [] };
 let syncInterval = null;
 let lastSyncAt = 0;
 let syncing = false;
@@ -547,12 +548,27 @@ let lastRoundTrip = 0;
 let manualStop = false;
 
 /*
- * 儀表板背景更新間隔。
+ * 本地名單快照
  *
- * 原本 5 秒太密集：Apps Script 每次呼叫都要 1～2 秒，
- * 背景一直打會跟報到搶頻寬，在台灣特別明顯。
+ * 掃到 QR 先在這裡查出名字座位馬上顯示，
+ * 真正的寫入丟進 queue 背景送。
+ * 網路來回 2 秒的情況下，工作人員感覺不到延遲。
  */
-const SYNC_INTERVAL_MS = 20000;
+let roster = [];
+let rosterIndex = null;
+
+/* 待送出的報到，會合併成一趟批次送出 */
+let queue = [];
+let draining = false;
+let drainFailed = false;
+let mismatches = [];
+
+const BATCH_MAX = 15;
+const DRAIN_DELAY_MS = 400;     // 連續掃描時稍等一下，讓多筆併成一趟
+const RETRY_DELAY_MS = 4000;
+
+/* 閒著沒事時重新抓一次名單，讓多台裝置的數字對得上 */
+const SYNC_INTERVAL_MS = 60000;
 
 let isProcessing = false;   // 正在送出報到
 let photoBusy = false;      // 正在解照片
@@ -571,8 +587,27 @@ const SAME_CODE_COOLDOWN = 3000;
 
 
 window.onload = function () {
+  loadQueue();
+  renderPending();
+  if (queue.length) scheduleDrain(1500);
   loadCourses();
 };
+
+
+/* 還有沒寫進 Sheet 的資料時，不要讓人不小心關掉 */
+window.addEventListener('beforeunload', function (e) {
+  if (queue.length) {
+    e.preventDefault();
+    e.returnValue = '';
+    return '';
+  }
+});
+
+
+/* 回到前景時把積壓的送一送 */
+document.addEventListener('visibilitychange', function () {
+  if (!document.hidden && queue.length) scheduleDrain(500);
+});
 
 
 
@@ -740,7 +775,8 @@ function changeCourse() {
 
     if (scanning) stopScan();
 
-    currentStats = { total: 0, present: 0, absents: [] };
+    roster = [];
+    rosterIndex = null;
     renderDashboard();
 
     updateButtons();
@@ -766,6 +802,7 @@ function changeCourse() {
      * 數字本來就會跟著每次報到一起回來。
      */
     if (isProcessing || photoBusy || scanning || document.hidden) return;
+    if (queue.length || draining) return;   // 還有東西沒送出時不要蓋掉本地狀態
     fetchCourseData(true);
   }, SYNC_INTERVAL_MS);
 
@@ -775,26 +812,38 @@ function changeCourse() {
 
 
 /* =========================================================
-   讀取課程資料（儀表板）
+   名單快照 + 背景送出佇列
    ========================================================= */
+
+function buildRosterIndex() {
+
+  rosterIndex = new Map();
+
+  roster.forEach(function (e) {
+    if (e.q) rosterIndex.set(e.q, e);
+    if (e.n) rosterIndex.set(e.n, e);
+  });
+}
+
 
 function fetchCourseData(silent) {
 
   if (!currentCourse) return;
-
   if (syncing) return;
+
   syncing = true;
 
   const requestedCourse = currentCourse;
 
-  api({ action: 'data', course: currentCourse })
+  api({ action: 'roster', course: currentCourse })
 
     .then(function (res) {
 
       if (requestedCourse !== currentCourse) return;
 
-      if (res && res.ok && res.stats) {
-        currentStats = res.stats;
+      if (res && res.ok && Array.isArray(res.roster)) {
+        roster = res.roster;
+        buildRosterIndex();
         lastSyncAt = Date.now();
       }
 
@@ -823,6 +872,195 @@ function fetchCourseData(silent) {
     .then(function () { syncing = false; });
 }
 
+
+/* ---------- 佇列 ---------- */
+
+function queueKey() {
+  return 'pendingQueue_v1';
+}
+
+
+function saveQueue() {
+  try {
+    localStorage.setItem(queueKey(), JSON.stringify(queue));
+  } catch (e) {}
+}
+
+
+function loadQueue() {
+  try {
+    const raw = localStorage.getItem(queueKey());
+    queue = raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    queue = [];
+  }
+  if (!Array.isArray(queue)) queue = [];
+}
+
+
+function enqueue(value, course) {
+  queue.push({ v: value, c: course, tries: 0 });
+  saveQueue();
+  renderPending();
+  scheduleDrain(DRAIN_DELAY_MS);
+}
+
+
+let drainTimer = null;
+
+function scheduleDrain(delay) {
+  if (drainTimer) clearTimeout(drainTimer);
+  drainTimer = setTimeout(drain, delay);
+}
+
+
+function drain() {
+
+  drainTimer = null;
+
+  if (draining || queue.length === 0) return;
+
+  // 同一批只送同一個課程的
+  const course = queue[0].c;
+  const batch = [];
+
+  for (let i = 0; i < queue.length && batch.length < BATCH_MAX; i++) {
+    if (queue[i].c === course) batch.push(queue[i]);
+  }
+
+  if (batch.length === 0) return;
+
+  draining = true;
+  renderPending();
+
+  api({
+    action: 'checkin_batch',
+    course: course,
+    values: JSON.stringify(batch.map(function (x) { return x.v; }))
+  })
+
+    .then(function (res) {
+
+      if (res && res.ok && Array.isArray(res.results)) {
+
+        // 送成功的從佇列移除
+        queue = queue.filter(function (item) {
+          return batch.indexOf(item) < 0;
+        });
+
+        reconcile(res.results);
+        drainFailed = false;
+
+      } else {
+        throw new Error((res && res.message) || '同步失敗');
+      }
+
+    })
+
+    .catch(function (error) {
+
+      console.error(error);
+      drainFailed = true;
+      batch.forEach(function (x) { x.tries++; });
+
+    })
+
+    .then(function () {
+
+      draining = false;
+      saveQueue();
+      renderPending();
+
+      /*
+       * 成功就馬上接著送下一批；
+       * 失敗才等久一點重試。
+       */
+      if (queue.length) {
+        scheduleDrain(drainFailed ? RETRY_DELAY_MS : DRAIN_DELAY_MS);
+      }
+    });
+}
+
+
+/*
+ * 伺服器的結果跟本地先前顯示的不一致時記下來。
+ * 例如另一台裝置先幫同一個人報到了。
+ */
+function reconcile(results) {
+
+  results.forEach(function (r) {
+
+    if (!r) return;
+
+    const entry = rosterIndex ? rosterIndex.get(r.value) : null;
+
+    if (r.type === 'success') {
+      if (entry && typeof r.remaining === 'number') {
+        entry.r = r.remaining;
+        entry.d = 1;
+      }
+      return;
+    }
+
+    if (r.type === 'temporary') {
+      if (!entry) {
+        const item = { q: r.qr || '', n: r.name, s: r.seat, r: 0, d: 1 };
+        roster.push(item);
+        if (item.q) rosterIndex.set(item.q, item);
+        if (item.n) rosterIndex.set(item.n, item);
+      }
+      return;
+    }
+
+    // duplicate / no_credit / error：本地顯示過成功，但伺服器不認
+    mismatches.push((r.name || r.value) + '：' + (r.message || r.type));
+
+    if (entry) {
+      entry.d = 1;
+      if (r.type === 'no_credit') entry.r = 0;
+    }
+  });
+
+  lastSyncAt = Date.now();
+  renderDashboard();
+  renderPending();
+}
+
+
+function renderPending() {
+
+  const box = document.getElementById('pendingBox');
+  if (!box) return;
+
+  const stuck = queue.filter(function (x) { return x.tries >= 2; }).length;
+
+  if (mismatches.length) {
+
+    box.style.display = 'block';
+    box.style.background = '#fdecea';
+    box.style.color = '#b3261e';
+    box.textContent = '⚠️ ' + mismatches.slice(-3).join('；') +
+      '（伺服器與畫面不一致，請以 Sheet 為準）';
+
+  } else if (stuck) {
+
+    box.style.display = 'block';
+    box.style.background = '#fdecea';
+    box.style.color = '#b3261e';
+    box.textContent = '⚠️ ' + queue.length + ' 筆還沒寫進 Sheet，連線有問題。先別關掉這一頁。';
+
+  } else if (queue.length) {
+
+    box.style.display = 'block';
+    box.style.background = '#fff8e1';
+    box.style.color = '#8a6d00';
+    box.textContent = '⏳ 背景寫入中… 還有 ' + queue.length + ' 筆';
+
+  } else {
+    box.style.display = 'none';
+    box.textContent = '';
+  }
+}
 
 
 /* =========================================================
@@ -1805,6 +2043,9 @@ function handleEnter(event) {
 
 /* =========================================================
    送出報到
+
+   名單裡有的人：本地立刻判定並顯示，寫入丟背景佇列。
+   名單外的人：只能問伺服器（要它決定臨時人員的處理）。
    ========================================================= */
 
 function submitCheckIn(value, source) {
@@ -1816,13 +2057,60 @@ function submitCheckIn(value, source) {
     return;
   }
 
+  const entry = rosterIndex ? rosterIndex.get(value) : null;
+
+  /* ---------- 本地即時判定 ---------- */
+
+  if (entry) {
+
+    if (entry.d) {
+      showUI('重複報到', (entry.n || value) + '\n座位：' + (entry.s || '未安排'), 'error');
+      playSound('error');
+      vibrateError();
+      setDiag('本地判定，未送出');
+      pauseAfterResult();
+      return;
+    }
+
+    if (entry.r <= 0) {
+      showUI('堂數不足', (entry.n || value) + '\n剩餘可用堂數為 0', 'error');
+      playSound('error');
+      vibrateError();
+      setDiag('本地判定，未送出');
+      pauseAfterResult();
+      return;
+    }
+
+    // 樂觀更新：先當作成功
+    entry.d = 1;
+    entry.r = entry.r - 1;
+
+    showUI(
+      entry.n || value,
+      '✅ 報到成功！\n座位：' + (entry.s || '未安排') + ' | 剩餘：' + entry.r + ' 堂',
+      'success'
+    );
+
+    playSound('success');
+    vibrateSuccess();
+    setDiag('即時顯示，背景寫入中');
+
+    renderDashboard();
+    enqueue(value, currentCourse);
+    pauseAfterResult();
+    return;
+  }
+
+
+  /* ---------- 名單外：要等伺服器 ---------- */
+
   const input = document.getElementById('qrInput');
 
   isProcessing = true;
   input.disabled = true;
   updateButtons();
 
-  showUI('處理中...', '連線中…', 'warn');
+  showUI('處理中...', '名單裡沒有，連線確認中…', 'warn');
 
   const t0 = Date.now();
 
@@ -1843,16 +2131,14 @@ function submitCheckIn(value, source) {
       input.disabled = false;
       updateButtons();
 
-      /*
-       * 快速路徑不回 stats（省下掃全表），
-       * 這裡自己把數字補上；下一次 data 會校正回來。
-       */
-      if (result && result.stats) {
-        currentStats = result.stats;
-        lastSyncAt = Date.now();
+      if (result && result.type === 'temporary') {
+        const item = { q: result.qr || '', n: result.name, s: result.seat, r: 0, d: 1 };
+        roster.push(item);
+        if (rosterIndex) {
+          if (item.q) rosterIndex.set(item.q, item);
+          if (item.n) rosterIndex.set(item.n, item);
+        }
         renderDashboard();
-      } else if (result && result.ok) {
-        bumpStatsLocally(result);
       }
 
       handleCheckInResult(result);
@@ -1873,32 +2159,9 @@ function submitCheckIn(value, source) {
 }
 
 
-
 /* =========================================================
    報到結果
    ========================================================= */
-
-/*
- * 本地累加儀表板數字，不用再跟伺服器要一次。
- */
-function bumpStatsLocally(result) {
-
-  if (!currentStats) currentStats = { total: 0, present: 0, absents: [] };
-  if (!currentStats.absents) currentStats.absents = [];
-
-  if (result.type === 'temporary') {
-    currentStats.total = (currentStats.total || 0) + 1;
-    currentStats.present = (currentStats.present || 0) + 1;
-  } else if (result.type === 'success') {
-    currentStats.present = (currentStats.present || 0) + 1;
-
-    const i = currentStats.absents.indexOf(result.name);
-    if (i >= 0) currentStats.absents.splice(i, 1);
-  }
-
-  renderDashboard();
-}
-
 
 function showRoundTrip(result) {
 
@@ -1992,11 +2255,19 @@ function handleCheckInResult(result) {
 
 function renderDashboard() {
 
-  const stats = currentStats || { total: 0, present: 0, absents: [] };
-  const absents = stats.absents || [];
+  let present = 0;
+  const absents = [];
 
-  document.getElementById('totalCount').textContent = stats.total || 0;
-  document.getElementById('presentCount').textContent = stats.present || 0;
+  roster.forEach(function (e) {
+    if (e.d) {
+      present++;
+    } else {
+      absents.push(e.n || e.q || '未命名');
+    }
+  });
+
+  document.getElementById('totalCount').textContent = roster.length;
+  document.getElementById('presentCount').textContent = present;
 
   const listDiv = document.getElementById('absentList');
 
