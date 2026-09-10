@@ -7,6 +7,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
   <title>極速場控報到系統</title>
 
+  <link rel="preconnect" href="https://script.google.com" crossorigin>
+  <link rel="preconnect" href="https://script.googleusercontent.com" crossorigin>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+
   <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 
   <style>
@@ -477,7 +481,15 @@
     <!-- ========== Dashboard ========== -->
     <div class="dash-panel">
 
-      <h3 style="margin-top:0;">📊 即時儀表板</h3>
+      <h3 style="margin-top:0;margin-bottom:4px;">📊 即時儀表板</h3>
+
+      <div style="font-size:12px;color:#999;margin-bottom:12px;">
+        <span id="syncStamp"></span>
+        <button id="btnRefresh" onclick="fetchCourseData(false)"
+                style="border:none;background:none;color:#2196F3;cursor:pointer;font-size:12px;padding:0 4px;">
+          🔄 立即更新
+        </button>
+      </div>
 
       <div class="dash-item">
         應到人數：<span id="totalCount" class="dash-number">0</span>
@@ -527,8 +539,19 @@ const API_TOKEN = '3f350a2c70d6b4dbd9d6e62c';
    ========================================================= */
 
 let currentCourse = '';
-let currentCourseData = [];
+let currentStats = { total: 0, present: 0, absents: [] };
 let syncInterval = null;
+let lastSyncAt = 0;
+let syncing = false;
+let lastRoundTrip = 0;
+
+/*
+ * 儀表板背景更新間隔。
+ *
+ * 原本 5 秒太密集：Apps Script 每次呼叫都要 1～2 秒，
+ * 背景一直打會跟報到搶頻寬，在台灣特別明顯。
+ */
+const SYNC_INTERVAL_MS = 20000;
 
 let isProcessing = false;   // 正在送出報到
 let photoBusy = false;      // 正在解照片
@@ -716,7 +739,7 @@ function changeCourse() {
 
     if (scanning) stopScan();
 
-    currentCourseData = [];
+    currentStats = { total: 0, present: 0, absents: [] };
     renderDashboard();
 
     updateButtons();
@@ -733,8 +756,10 @@ function changeCourse() {
   }
 
   syncInterval = setInterval(function () {
+    // 掃描/送出中或分頁在背景時跳過，不跟報到搶速度
+    if (isProcessing || photoBusy || document.hidden) return;
     fetchCourseData(true);
-  }, 5000);
+  }, SYNC_INTERVAL_MS);
 
   updateButtons();
 }
@@ -749,6 +774,9 @@ function fetchCourseData(silent) {
 
   if (!currentCourse) return;
 
+  if (syncing) return;
+  syncing = true;
+
   const requestedCourse = currentCourse;
 
   api({ action: 'data', course: currentCourse })
@@ -757,7 +785,10 @@ function fetchCourseData(silent) {
 
       if (requestedCourse !== currentCourse) return;
 
-      currentCourseData = (res && res.ok && Array.isArray(res.list)) ? res.list : [];
+      if (res && res.ok && res.stats) {
+        currentStats = res.stats;
+        lastSyncAt = Date.now();
+      }
 
       renderDashboard();
 
@@ -779,7 +810,9 @@ function fetchCourseData(silent) {
 
     .catch(function (error) {
       if (!silent) handleServerError(error);
-    });
+    })
+
+    .then(function () { syncing = false; });
 }
 
 
@@ -1764,26 +1797,44 @@ function submitCheckIn(value, source) {
   input.disabled = true;
   updateButtons();
 
-  showUI('處理中...',
-    source === 'camera' ? '已讀取 QR Code'
-      : (source === 'photo' ? '已讀取 QR Code' : ''),
-    'warn');
+  showUI('處理中...', '連線中…', 'warn');
+
+  const t0 = Date.now();
+
+  const ticker = setInterval(function () {
+    if (!isProcessing) { clearInterval(ticker); return; }
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    document.getElementById('subDisplay').textContent = '連線中… ' + secs + ' 秒';
+  }, 200);
 
   api({ action: 'checkin', course: currentCourse, value: value })
 
     .then(function (result) {
 
+      clearInterval(ticker);
+      lastRoundTrip = Date.now() - t0;
+
       isProcessing = false;
       input.disabled = false;
       updateButtons();
 
-      handleCheckInResult(result);
+      /*
+       * 儀表板數字跟著 checkin 一起回來了，
+       * 不用再多打一趟 data。
+       */
+      if (result && result.stats) {
+        currentStats = result.stats;
+        lastSyncAt = Date.now();
+        renderDashboard();
+      }
 
-      fetchCourseData(true);
+      handleCheckInResult(result);
       focusScanner();
     })
 
     .catch(function (error) {
+
+      clearInterval(ticker);
 
       isProcessing = false;
       input.disabled = false;
@@ -1799,6 +1850,13 @@ function submitCheckIn(value, source) {
 /* =========================================================
    報到結果
    ========================================================= */
+
+function showRoundTrip() {
+  if (lastRoundTrip) {
+    setDiag('伺服器來回 ' + (lastRoundTrip / 1000).toFixed(1) + ' 秒');
+  }
+}
+
 
 function handleCheckInResult(result) {
 
@@ -1817,6 +1875,7 @@ function handleCheckInResult(result) {
     );
     playSound('success');
     vibrateSuccess();
+    showRoundTrip();
     pauseAfterResult();
     return;
   }
@@ -1870,20 +1929,11 @@ function handleCheckInResult(result) {
 
 function renderDashboard() {
 
-  const total = currentCourseData.length;
-  let present = 0;
-  const absents = [];
+  const stats = currentStats || { total: 0, present: 0, absents: [] };
+  const absents = stats.absents || [];
 
-  currentCourseData.forEach(function (user) {
-    if (user.status === '已報到') {
-      present++;
-    } else {
-      absents.push(user.name || user.qr || '未命名');
-    }
-  });
-
-  document.getElementById('totalCount').textContent = total;
-  document.getElementById('presentCount').textContent = present;
+  document.getElementById('totalCount').textContent = stats.total || 0;
+  document.getElementById('presentCount').textContent = stats.present || 0;
 
   const listDiv = document.getElementById('absentList');
 
@@ -1891,6 +1941,20 @@ function renderDashboard() {
     listDiv.textContent = absents.length > 0
       ? absents.join('、')
       : '目前全員皆已報到或尚無名單';
+  }
+
+  const stamp = document.getElementById('syncStamp');
+
+  if (stamp) {
+    if (!lastSyncAt) {
+      stamp.textContent = '';
+    } else {
+      const d = new Date(lastSyncAt);
+      stamp.textContent = '更新於 ' +
+        ('0' + d.getHours()).slice(-2) + ':' +
+        ('0' + d.getMinutes()).slice(-2) + ':' +
+        ('0' + d.getSeconds()).slice(-2);
+    }
   }
 }
 
