@@ -588,6 +588,15 @@ let statusTimer = null;
 /* 手機上要看得到自己跑的是哪一版，才知道有沒有更新到 */
 const APP_VERSION = 'v13';
 
+/*
+ * 這一版自己放進佇列的，都蓋這個章。
+ *
+ * 手動打的姓名本來就不在名單上，不能因為「名單查不到」就丟掉；
+ * 真正要擋的是舊版本留在瀏覽器裡、沒蓋章的殘留資料
+ * （就是以前會在 Sheet 裡冒出「好」那一種）。
+ */
+const QUEUE_MARK = 'q-v13';
+
 const BATCH_MAX = 15;
 const DRAIN_DELAY_MS = 400;     // 連續掃描時稍等一下，讓多筆併成一趟
 const RETRY_DELAY_MS = 4000;
@@ -942,12 +951,41 @@ function applyRoster(list, isFull) {
   roster = list;
   buildRosterIndex();
 
+  /*
+   * 名單外的臨時人員（櫃台手動打的名字）伺服器名單上沒有，
+   * 每次套用新名單都要整筆補回去，否則他會從畫面上消失，
+   * 送出前的檢查也會把他當成來路不明的東西。
+   */
   queue.forEach(function (item) {
+
     const e = rosterIndex.get(item.v);
-    if (e && !e.d) {
-      e.d = 1;
-      if (e.r > 0) e.r = e.r - 1;
+
+    if (e) {
+      if (!e.d) {
+        e.d = 1;
+        if (e.r > 0) e.r = e.r - 1;
+      }
+      return;
     }
+
+    /* 沒蓋章的是舊版殘留，等一下 sanitizeQueue 會丟掉，不要幫它復活 */
+    if (!item || item.ok !== QUEUE_MARK) return;
+
+    const likelyQr = treatAsQr(item.v, item.src);
+
+    const temp = {
+      q: likelyQr ? item.v : '',
+      n: likelyQr ? '臨時人員' : item.v,
+      s: TEMP_SEAT,
+      r: 0,
+      d: 1,
+      temp: true
+    };
+
+    roster.push(temp);
+    if (temp.q) rosterIndex.set(temp.q, temp);
+    if (temp.n) rosterIndex.set(temp.n, temp);
+    rosterIndex.set(item.v, temp);
   });
 
   lastSyncAt = Date.now();
@@ -1049,7 +1087,7 @@ function loadQueue() {
 
 
 function enqueue(value, course, source) {
-  queue.push({ v: value, c: course, tries: 0, src: source || '?' });
+  queue.push({ v: value, c: course, tries: 0, src: source || '?', ok: QUEUE_MARK });
   saveQueue();
   renderPending();
   scheduleDrain(DRAIN_DELAY_MS);
@@ -1058,6 +1096,15 @@ function enqueue(value, course, source) {
 
 let drainTimer = null;
 
+/*
+ * 正在送出去、還沒收到回覆的那一批。
+ *
+ * 已經送出去的東西，伺服器可能已經寫進 Sheet 了，
+ * 這時候再說「已擋下、未寫入」就是騙人——畫面和 Sheet 會對不起來。
+ * 所以檢查的時候一律跳過在途中的。
+ */
+let inFlight = [];
+
 function scheduleDrain(delay) {
   if (drainTimer) clearTimeout(drainTimer);
   drainTimer = setTimeout(drain, delay);
@@ -1065,35 +1112,50 @@ function scheduleDrain(delay) {
 
 
 /*
- * 佇列裡「只可能」有名單內的人。
+ * 送出前的最後一道檢查。
  *
- * 名單外的內容一律要人按確認；按了確認之後才會被加進本地名單，
- * 然後才進佇列。所以佇列裡出現本地名單上沒有的東西，
- * 一定是舊版留下的殘留或壞掉的資料——那正是 Sheet 裡
- * 莫名多出「好 / 臨時劃位」那種列的來源。
+ * 只擋一種東西：舊版本留在這台瀏覽器 localStorage 裡、沒蓋章的殘留資料。
+ * 那是以前 Sheet 裡會莫名冒出「好 / 臨時劃位」那種列的來源。
  *
- * 送出前先把這種東西擋掉，不要讓它繞過確認視窗寫進去。
+ * 這一版自己放進去的一律放行——不管是掃到的 QR，
+ * 還是櫃台手動打、名單上根本沒有的姓名（臨時人員）。
+ * 名單外的人本來就查不到，不能因為查不到就把他的報到丟掉。
  */
 function sanitizeQueue() {
-
-  if (!rosterIndex) return;      // 名單還沒載入，先不動
 
   const kept = [];
   const dropped = [];
 
   queue.forEach(function (item) {
-    if (rosterIndex.get(item.v)) {
-      kept.push(item);
-    } else {
-      dropped.push(item.v);
+
+    if (inFlight.indexOf(item) >= 0) {
+      kept.push(item);                 // 已經送出去了，不能說沒寫入
+      return;
     }
+
+    if (item && item.ok === QUEUE_MARK) {
+      kept.push(item);                 // 這一版自己掃的／自己打的
+      return;
+    }
+
+    if (!rosterIndex) {
+      kept.push(item);                 // 名單還沒載入，先不判，等下一趟
+      return;
+    }
+
+    if (rosterIndex.get(item.v)) {
+      kept.push(item);                 // 名單上真的有這個人
+      return;
+    }
+
+    dropped.push(item && item.v);
   });
 
   if (dropped.length) {
     queue = kept;
     saveQueue();
     dropped.forEach(function (v) {
-      mismatches.push('已擋下不明內容「' + v + '」，未寫入 Sheet');
+      mismatches.push('已擋下舊版殘留的「' + v + '」，未寫入 Sheet');
     });
     renderPending();
   }
@@ -1119,6 +1181,7 @@ function drain() {
   if (batch.length === 0) return;
 
   draining = true;
+  inFlight = batch;
   drainStartedAt = Date.now();
   renderPending();
 
@@ -1131,6 +1194,10 @@ function drain() {
     action: 'checkin_batch',
     course: course,
     values: JSON.stringify(batch.map(function (x) { return x.v; })),
+    /* m = 櫃台手打的（當姓名），s = 相機掃到的（可能是 QR） */
+    srcs: JSON.stringify(batch.map(function (x) {
+      return x.src === 'manual' ? 'm' : 's';
+    })),
     withRoster: needRoster,
     fresh: (needRoster && wantFull) ? 1 : 0
   })
@@ -1173,6 +1240,7 @@ function drain() {
     .then(function () {
 
       draining = false;
+      inFlight = [];
       saveQueue();
       renderPending();
 
@@ -1841,7 +1909,7 @@ function submitCheckIn(value, source) {
 
   /* ---------- 名單外：直接加，不問 ---------- */
 
-  addTemp(value, currentCourse);
+  addTemp(value, currentCourse, source);
 }
 
 
@@ -1851,6 +1919,26 @@ function submitCheckIn(value, source) {
  * 有中日韓文字或空白 → 當成姓名；否則當成 QR 內容。
  * 兩邊要一致，畫面顯示的名字才會等於 Sheet 裡寫進去的。
  */
+/*
+ * 這串東西該當成 QR 還是姓名？跟 Code.gs 的規則一致。
+ *
+ * 報到碼一定是 A 或 B 開頭加數字。
+ * 櫃台手打的東西只要不是這個形狀，就是姓名——
+ * 「Sophia」「Amy Chen」「VIP7」都是姓名，不是 QR 碼。
+ */
+function treatAsQr(value, source) {
+
+  /*
+   * 手打的：只有長得像報到碼（A 或 B 開頭加數字）才當 QR，
+   * 其餘一律當姓名——包含英文名字。
+   * 相機掃到的才用字元去猜。
+   */
+  if (source === 'manual') return QR_PATTERN.test(String(value || '').trim());
+
+  return looksLikeQrLocal(value);
+}
+
+
 function looksLikeQrLocal(value) {
   value = String(value || '').trim();
   if (!value) return false;
@@ -1866,9 +1954,9 @@ const TEMP_SEAT = '臨時劃位（請洽櫃台）';
  * 名單外的人：立刻在本地加進去，寫入丟背景佇列。
  * 跟名單內的人走同一條路，完全不等網路。
  */
-function addTemp(value, course) {
+function addTemp(value, course, source) {
 
-  const likelyQr = looksLikeQrLocal(value);
+  const likelyQr = treatAsQr(value, source);
 
   const item = {
     q: likelyQr ? value : '',
@@ -1894,7 +1982,7 @@ function addTemp(value, course) {
   setDiag('名單外，已加入並背景寫入');
 
   renderDashboard();
-  enqueue(value, course, 'temp');
+  enqueue(value, course, source || 'camera');
   pauseAfterResult();
 }
 
