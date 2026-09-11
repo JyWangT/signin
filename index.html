@@ -210,6 +210,36 @@
       margin: 4px 0 14px 0;
     }
 
+    .manual-row {
+      display: flex;
+      gap: 8px;
+      width: 100%;
+      align-items: stretch;
+    }
+
+    .manual-row input[type="text"] {
+      flex: 1;
+      min-width: 0;
+    }
+
+    #btnSubmit {
+      flex: 0 0 auto;
+      padding: 0 22px;
+      font-size: 18px;
+      font-weight: bold;
+      border: none;
+      border-radius: 8px;
+      background: #4CAF50;
+      color: white;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    #btnSubmit:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+
     .manual-label {
       width: 100%;
       font-size: 14px;
@@ -379,7 +409,7 @@
 
 <body>
 
-  <p class="version-tag" style="font-size:12px;color:#777">即時掃描版 v10</p>
+  <p class="version-tag" style="font-size:12px;color:#777">即時掃描版 v11</p>
 
 
   <!-- ========== 課程 ========== -->
@@ -429,11 +459,15 @@
       </div>
 
       <div class="manual-label">
-        或貼上 QR 文字／手動輸入姓名後按 Enter：
+        或手動輸入姓名／QR 內容：
       </div>
 
-      <input type="text" id="qrInput" placeholder="請先於上方選擇課程..." disabled
-             onkeydown="handleEnter(event)" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <div class="manual-row">
+        <input type="text" id="qrInput" placeholder="請先於上方選擇課程..." disabled
+               onkeydown="handleEnter(event)" oninput="updateSubmitBtn()"
+               autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button id="btnSubmit" onclick="submitManual()" disabled>送出</button>
+      </div>
 
       <div id="resultDisplay" class="result-text">等待選擇</div>
       <div id="subDisplay" class="sub-text"></div>
@@ -534,7 +568,7 @@ let nextRetryAt = 0;
 let statusTimer = null;
 
 /* 手機上要看得到自己跑的是哪一版，才知道有沒有更新到 */
-const APP_VERSION = 'v10';
+const APP_VERSION = 'v11';
 
 const BATCH_MAX = 15;
 const DRAIN_DELAY_MS = 400;     // 連續掃描時稍等一下，讓多筆併成一趟
@@ -783,6 +817,7 @@ function changeCourse() {
 
     qrInput.disabled = true;
     qrInput.placeholder = '請先於上方選擇課程...';
+    updateSubmitBtn();
 
     showUI('等待選擇', '', '');
 
@@ -802,6 +837,7 @@ function changeCourse() {
   }
 
   qrInput.disabled = true;
+  updateSubmitBtn();
   showUI('載入名單中...', '', 'warn');
 
   fetchCourseData(false);
@@ -901,6 +937,7 @@ function fetchCourseData(silent) {
       if (input.disabled && !isProcessing) {
         input.disabled = false;
         input.placeholder = '請輸入 QR Code 或姓名...';
+        updateSubmitBtn();
       }
 
       if (!silent && !isProcessing) {
@@ -1606,6 +1643,7 @@ function updateButtons() {
    */
   document.getElementById('btnScan').disabled = noCourse || (busy && !scanning);
   document.getElementById('btnNewCourse').disabled = busy;
+  updateSubmitBtn();
   document.getElementById('courseSelect').disabled = busy;
 }
 
@@ -1620,9 +1658,19 @@ function setDiag(text) {
    ========================================================= */
 
 function handleEnter(event) {
-
   if (event.key !== 'Enter') return;
   event.preventDefault();
+  submitManual();
+}
+
+
+/*
+ * 手動輸入的送出。
+ *
+ * 按 Enter 或按「送出」都會走到這裡——
+ * 手機鍵盤的 Enter 有時候是換行不是送出，所以要有按鈕。
+ */
+function submitManual() {
 
   const input = document.getElementById('qrInput');
   const value = input.value.trim();
@@ -1635,8 +1683,18 @@ function handleEnter(event) {
   }
 
   input.value = '';
+  updateSubmitBtn();
   lastCode = '';
+
   submitCheckIn(value, 'manual');
+}
+
+
+function updateSubmitBtn() {
+  const input = document.getElementById('qrInput');
+  const btn = document.getElementById('btnSubmit');
+  if (!btn) return;
+  btn.disabled = input.disabled || !input.value.trim();
 }
 
 
@@ -1673,7 +1731,13 @@ function submitCheckIn(value, source) {
     }
 
     if (entry.r <= 0) {
-      showUI('堂數不足', (entry.n || value) + '\n剩餘可用堂數為 0', 'error');
+      showUI(
+        '堂數不足',
+        (entry.n || value) +
+        '\n座位：' + (entry.s || '未安排') +
+        '\n剩餘可用堂數為 0',
+        'error'
+      );
       playSound('error');
       vibrateError();
       setDiag('本地判定，未送出');
@@ -1825,7 +1889,13 @@ function handleCheckInResult(result) {
   }
 
   if (result.type === 'no_credit') {
-    showUI('堂數不足', result.name + '\n剩餘可用堂數為 0', 'error');
+    showUI(
+      '堂數不足',
+      result.name +
+      '\n座位：' + (result.seat || '未安排') +
+      '\n剩餘可用堂數為 0',
+      'error'
+    );
     playSound('error');
     vibrateError();
     showRoundTrip(result);
