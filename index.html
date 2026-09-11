@@ -369,7 +369,6 @@
       .sub-text { font-size: 16pt; min-height: 36px; }
       .hint { margin: 2px 0 8px 0; }
       .camera-button { padding: 12px; margin-bottom: 8px; }
-      .version-tag { display: none; }
       .top-bar { margin-bottom: 12px; }
     }
 
@@ -380,7 +379,7 @@
 
 <body>
 
-  <p class="version-tag" style="font-size:12px;color:#777">即時掃描版 v7</p>
+  <p class="version-tag" style="font-size:12px;color:#777">即時掃描版 v9</p>
 
 
   <!-- ========== 課程 ========== -->
@@ -558,6 +557,9 @@ let drainStartedAt = 0;
 let lastWriteOkAt = 0;      // 最後一次「全部寫進 Sheet」的時間
 let nextRetryAt = 0;
 let statusTimer = null;
+
+/* 手機上要看得到自己跑的是哪一版，才知道有沒有更新到 */
+const APP_VERSION = 'v9';
 
 const BATCH_MAX = 15;
 const DRAIN_DELAY_MS = 400;     // 連續掃描時稍等一下，讓多筆併成一趟
@@ -901,6 +903,7 @@ function fetchCourseData(silent) {
 
       if (res && res.ok && Array.isArray(res.roster)) {
         applyRoster(res.roster);
+        sanitizeQueue();
       }
 
       renderDashboard();
@@ -954,8 +957,8 @@ function loadQueue() {
 }
 
 
-function enqueue(value, course) {
-  queue.push({ v: value, c: course, tries: 0 });
+function enqueue(value, course, source) {
+  queue.push({ v: value, c: course, tries: 0, src: source || '?' });
   saveQueue();
   renderPending();
   scheduleDrain(DRAIN_DELAY_MS);
@@ -970,9 +973,47 @@ function scheduleDrain(delay) {
 }
 
 
+/*
+ * 佇列裡「只可能」有名單內的人。
+ *
+ * 名單外的內容一律要人按確認；按了確認之後才會被加進本地名單，
+ * 然後才進佇列。所以佇列裡出現本地名單上沒有的東西，
+ * 一定是舊版留下的殘留或壞掉的資料——那正是 Sheet 裡
+ * 莫名多出「好 / 臨時劃位」那種列的來源。
+ *
+ * 送出前先把這種東西擋掉，不要讓它繞過確認視窗寫進去。
+ */
+function sanitizeQueue() {
+
+  if (!rosterIndex) return;      // 名單還沒載入，先不動
+
+  const kept = [];
+  const dropped = [];
+
+  queue.forEach(function (item) {
+    if (rosterIndex.get(item.v)) {
+      kept.push(item);
+    } else {
+      dropped.push(item.v);
+    }
+  });
+
+  if (dropped.length) {
+    queue = kept;
+    saveQueue();
+    dropped.forEach(function (v) {
+      mismatches.push('已擋下不明內容「' + v + '」，未寫入 Sheet');
+    });
+    renderPending();
+  }
+}
+
+
 function drain() {
 
   drainTimer = null;
+
+  sanitizeQueue();
 
   if (draining || queue.length === 0) return;
 
@@ -1164,7 +1205,7 @@ function renderPending() {
      * 別台手機剛掃的人，要等名單更新才會出現在這台畫面上，
      * 所以名單新鮮度另外講，不要混為一談。
      */
-    lines = ['✅ 這台掃的都已寫入 Sheet'];
+    lines = ['✅ 這台掃的都已寫入 Sheet · ' + APP_VERSION];
 
     if (lastWriteOkAt) {
       lines.push('最後寫入 ' + fmtClock(lastWriteOkAt));
@@ -1193,7 +1234,7 @@ function renderPending() {
     const wait = nextRetryAt ? Math.max(0, nextRetryAt - Date.now()) : 0;
 
     lines = [
-      '⚠️ ' + queue.length + ' 筆還沒寫進 Sheet',
+      '⚠️ ' + queue.length + ' 筆還沒寫進 Sheet · ' + APP_VERSION,
       draining
         ? '正在重試…'
         : (wait > 0 ? fmtSecs(wait) + '後自動重試' : '準備重試…') +
@@ -1208,7 +1249,7 @@ function renderPending() {
     fg = '#8a6d00';
 
     lines = [
-      '⏳ 寫入中 ' + queue.length + ' 筆',
+      '⏳ 寫入中 ' + queue.length + ' 筆 · ' + APP_VERSION,
       '約 ' + fmtSecs(estimateRemainingMs()) + '後與 Sheet 一致'
     ];
   }
@@ -1746,7 +1787,7 @@ function submitCheckIn(value, source) {
     setDiag('即時顯示，背景寫入中');
 
     renderDashboard();
-    enqueue(value, currentCourse);
+    enqueue(value, currentCourse, source || 'scan');
     pauseAfterResult();
     return;
   }
@@ -1765,6 +1806,23 @@ function submitCheckIn(value, source) {
  * Sheet 就會多出「好 / 123 / 臨時劃位」這種來路不明的列。
  */
 let pendingTemp = null;
+
+
+/*
+ * 跟 Code.gs 的 looksLikeQr() 同一套規則。
+ *
+ * 有中日韓文字或空白 → 當成姓名；否則當成 QR 內容。
+ * 兩邊要一致，畫面顯示的名字才會等於 Sheet 裡寫進去的。
+ */
+function looksLikeQrLocal(value) {
+  value = String(value || '').trim();
+  if (!value) return false;
+  if (/[\u3400-\u9FFF\u3040-\u30FF\uAC00-\uD7AF\s]/.test(value)) return false;
+  return true;
+}
+
+
+const TEMP_SEAT = '臨時劃位（請洽櫃台）';
 
 function askTemp(value) {
 
@@ -1800,64 +1858,45 @@ function confirmTemp() {
   pendingTemp = null;
   document.getElementById('tempModal').style.display = 'none';
 
-  sendTemp(value, course);
-}
+  if (course !== currentCourse) {
+    showUI('課程已變更', '請重新掃描一次', 'warn');
+    return;
+  }
 
+  /*
+   * 立刻在本地名單加進去，畫面馬上有結果，
+   * 真正的寫入丟背景佇列——跟名單內的人走同一條路。
+   *
+   * 名字的判定要跟伺服器一致，
+   * 否則畫面顯示「王小明」但 Sheet 寫「臨時人員」就對不起來。
+   */
+  const likelyQr = looksLikeQrLocal(value);
 
-function sendTemp(value, course) {
+  const item = {
+    q: likelyQr ? value : '',
+    n: likelyQr ? '臨時人員' : value,
+    s: TEMP_SEAT,
+    r: 0,
+    d: 1,
+    temp: true
+  };
 
-  const input = document.getElementById('qrInput');
+  roster.push(item);
 
-  isProcessing = true;
-  input.disabled = true;
-  updateButtons();
+  if (rosterIndex) {
+    if (item.q) rosterIndex.set(item.q, item);
+    if (item.n) rosterIndex.set(item.n, item);
+    // 掃到的原始內容也要能對上，佇列送出前的檢查才過得了
+    rosterIndex.set(value, item);
+  }
 
-  showUI('處理中...', '新增臨時人員中…', 'warn');
+  showUI('臨時人員加入成功', item.n + '\n座位：' + TEMP_SEAT, 'warn');
+  playSound('success');
+  vibrateSuccess();
+  setDiag('即時顯示，背景寫入中');
 
-  const t0 = Date.now();
-
-  const ticker = setInterval(function () {
-    if (!isProcessing) { clearInterval(ticker); return; }
-    const secs = ((Date.now() - t0) / 1000).toFixed(1);
-    document.getElementById('subDisplay').textContent = '連線中… ' + secs + ' 秒';
-  }, 200);
-
-  api({ action: 'checkin', course: course, value: value })
-
-    .then(function (result) {
-
-      clearInterval(ticker);
-      lastRoundTrip = Date.now() - t0;
-
-      isProcessing = false;
-      input.disabled = false;
-      updateButtons();
-
-      if (result && result.type === 'temporary') {
-        const item = { q: result.qr || '', n: result.name, s: result.seat, r: 0, d: 1 };
-        roster.push(item);
-        if (rosterIndex) {
-          if (item.q) rosterIndex.set(item.q, item);
-          if (item.n) rosterIndex.set(item.n, item);
-        }
-        renderDashboard();
-      }
-
-      handleCheckInResult(result);
-      focusScanner();
-    })
-
-    .catch(function (error) {
-
-      clearInterval(ticker);
-
-      isProcessing = false;
-      input.disabled = false;
-      updateButtons();
-
-      handleServerError(error);
-      focusScanner();
-    });
+  renderDashboard();
+  enqueue(value, course, 'temp');
 }
 
 
